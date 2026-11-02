@@ -1,0 +1,23 @@
+# Local analysis and planning notes
+/*.md
+!/README.md
+
+# Original course statement
+/proj3.pdf
+
+# Build products
+/build/
+/out/
+*.o
+*.obj
+*.exe
+*.out
+*.pdb
+*.ilk
+
+# Editor and operating-system files
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
