@@ -15,6 +15,9 @@
 *.pdb
 *.ilk
 
+# Expected outputs are source data for the samples.
+!/tests/samples/*.out
+
 # Editor and operating-system files
 .vs/
 .vscode/
