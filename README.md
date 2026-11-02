@@ -35,6 +35,57 @@ The algorithm stops after finding the first valid layout, since the problem acce
 
 Problem analysis and the implementation plan are complete. The production solver, test harness, benchmark results, and final report are still to be added.
 
+## Planned repository layout
+
+The implementation repository will grow to the following structure:
+
+```text
+ads-proj3/
+├── .gitignore
+├── README.md
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── model.hpp
+│   ├── model.cpp
+│   ├── solver.hpp
+│   ├── solver.cpp
+│   └── validator.hpp
+├── tests/
+│   ├── sample/
+│   ├── brute_force.cpp
+│   └── test_runner.cpp
+├── tools/
+│   ├── generate_tests.py
+│   ├── stress_test.py
+│   └── benchmark.py
+├── data/
+│   └── experiments/
+└── reports/
+    ├── report.tex
+    ├── report.pdf
+    └── figures/
+```
+
+Local-only planning files such as `PROBLEM_ANALYSIS.md`, `notes.md`, and `plan.md` are intentionally excluded from Git.
+
+## Planned submission package
+
+The course submission ZIP will be separate from the repository checkout:
+
+```text
+Teacher_2024G##_P3.zip
+├── documents/
+│   └── Teacher_2024G##_P3.pdf
+└── code/
+    ├── README.txt
+    ├── CMakeLists.txt
+    ├── src/
+    └── tests/
+```
+
+The exact teacher identifier, group number, and current-year naming rule must be checked against the latest course instructions before creating the final ZIP.
+
 ## Test strategy
 
 The three samples cover:
