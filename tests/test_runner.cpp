@@ -37,6 +37,58 @@ namespace {
 // For a model with E candidates, the oracle tries 2^E masks. It is restricted to
 // E <= 20 so the exhaustive tests remain practical. The solver has no such test
 // cutoff; the oracle is only a source of ground truth for small instances.
+//
+// The executable also acts as a small test dispatcher. Each name registered in
+// kTestGroups corresponds to one CTest entry, which lets a failure identify the
+// affected subsystem immediately. Running the executable without arguments is
+// still supported for local debugging and preserves the original all-tests path.
+//
+// Test categories have deliberately different emphases:
+// - parser tests validate text grammar and non-mutation on failure;
+// - model tests check graph construction, reciprocal indices, and static proofs;
+// - validator tests inspect independent output reconstruction and every rejection;
+// - samples and geometry tests cover the published and hand-derived boundaries;
+// - differential tests compare an unrelated exhaustive oracle with the solver;
+// - planted tests start from a hidden witness to catch over-aggressive pruning;
+// - propagation tests assert statistics that prove a pruning path was exercised.
+//
+// Correctness assertions favor exact error messages for validator branches. The
+// messages are small, stable parts of the diagnostic interface: changing one
+// usually means a branch was moved or removed. Parser assertions likewise check
+// messages, while solver assertions compare semantic outcomes or statistics.
+//
+// The test harness intentionally does not compare a solver answer with one
+// stored answer string. Multiple legal layouts can exist, and the validator is
+// the authority for degree, endpoint, ordering, and crossing constraints. The
+// stored sample outputs are used by CLI black-box tests instead.
+//
+// A failed parser call must leave the caller's previous Grid untouched. This is
+// stronger than merely returning false: partially published data would make a
+// caller continue with a matrix that does not correspond to the input text.
+//
+// Exhaustive tests enumerate inputs, while random tests choose a deterministic
+// sample from a larger space. Fixed seeds are part of the test contract because
+// they make every failure reproducible and keep benchmark comparisons stable.
+//
+// The brute-force and solver paths are deliberately not factored together. Any
+// shared helper that accidentally encoded the same pruning rule would weaken the
+// differential oracle, so small duplication is preferable to false confidence.
+//
+// Statistics are not treated as cosmetic instrumentation. A forced-selection
+// fixture must increment the corresponding counter, and a crossing fixture must
+// increment conflict rejections; otherwise a solver that guessed the expected
+// answer without exercising the advertised mechanism could still pass.
+//
+// Coverage is also checked qualitatively, not only by test count. Randomized
+// differential groups require both feasible and infeasible outcomes, at least
+// one rollback, and at least one propagation event. These assertions catch a
+// generator or filter that accidentally reduces thousands of cases to a narrow
+// class of trivial inputs.
+//
+// Tests that can fail early use a small failure cap. The cap keeps logs readable
+// when one modeling bug causes thousands of equivalent disagreements, while a
+// single failure still makes the process exit with a non-zero status.
+// A zero-failure run therefore means every case in the selected group completed.
 
 // Accumulate failures to report multiple issues in one run.
 int failures = 0;
@@ -49,6 +101,46 @@ void Expect(bool condition, const std::string& message) {
     }
 }
 
+// Aggregate evidence that randomized differential tests reached every major
+// solver outcome rather than exercising only trivial infeasible inputs.
+struct DifferentialCoverage {
+    // Count both possible solver conclusions.
+    int feasible = 0;
+    int infeasible = 0;
+
+    // Count work that proves non-leaf search and queue handling occurred.
+    std::uint64_t backtracks = 0;
+    std::uint64_t propagationEvents = 0;
+};
+
+void RecordDifferentialCoverage(const recover::SolveResult& result,
+                                DifferentialCoverage* coverage) {
+    if (coverage == nullptr) {
+        return;
+    }
+    if (result.found) {
+        ++coverage->feasible;
+    } else {
+        ++coverage->infeasible;
+    }
+    coverage->backtracks += result.stats.backtracks;
+    coverage->propagationEvents += result.stats.propagationEvents;
+}
+
+void ExpectDifferentialCoverage(const DifferentialCoverage& coverage,
+                                const std::string& context) {
+    // These assertions protect against a generator that accidentally produces
+    // only trivial zero grids or only immediately impossible instances.
+    Expect(coverage.feasible > 0,
+           context + " must contain at least one feasible case");
+    Expect(coverage.infeasible > 0,
+           context + " must contain at least one infeasible case");
+    Expect(coverage.backtracks > 0,
+           context + " must exercise rollback after failed branches");
+    Expect(coverage.propagationEvents > 0,
+           context + " must exercise queued propagation");
+}
+
 // Parse a text fixture and construct its static model.
 recover::Model BuildFromText(const std::string& text) {
     std::istringstream input(text);
@@ -56,7 +148,8 @@ recover::Model BuildFromText(const std::string& text) {
     std::string error;
     Expect(recover::ReadSingleCase(&input, &grid, &error), error);
 
-    // Parsing and model construction are independently checked stages.
+    // Parsing and model construction are independently checked stages. A
+    // failure in either stage increments the shared assertion counter.
     recover::Model model;
     Expect(recover::BuildModel(grid, &model, &error), error);
     return model;
@@ -67,6 +160,19 @@ recover::ValidationResult ValidateText(const recover::Model& model,
                                        const std::string& text) {
     std::istringstream output(text);
     return recover::ValidateOutput(model, &output);
+}
+
+void ExpectValidation(const recover::Model& model, const std::string& text,
+                      recover::ValidationStatus expectedStatus,
+                      const std::string& expectedMessage,
+                      const std::string& context) {
+    // Check both the machine-readable status and the exact diagnostic. Status
+    // alone could hide a different rejection happening earlier than intended.
+    const recover::ValidationResult result = ValidateText(model, text);
+    Expect(result.status == expectedStatus, context + ": unexpected status");
+    Expect(result.message == expectedMessage,
+           context + ": expected message '" + expectedMessage + "', got '" +
+               result.message + "'");
 }
 
 // Enumerate candidate-edge subsets without using any Solver decision order.
@@ -157,7 +263,8 @@ void TestSolverAndValidation(const std::vector<std::vector<int>>& grid,
 // Compare Solver with the brute-force oracle, then validate every witness.
 // context identifies the grid size and deterministic fixture on failure.
 void CheckDifferentialCase(const std::vector<std::vector<int>>& grid,
-                           const std::string& context) {
+                           const std::string& context,
+                           DifferentialCoverage* coverage = nullptr) {
     // Build from the input before computing either conclusion.
     recover::Model model;
     std::string error;
@@ -170,6 +277,7 @@ void CheckDifferentialCase(const std::vector<std::vector<int>>& grid,
     // solver fails, this assertion makes the disagreement immediately visible.
     recover::Solver solver(model);
     const recover::SolveResult result = solver.Solve();
+    RecordDifferentialCoverage(result, coverage);
     Expect(result.found == expected,
            context + ": solver disagrees with brute force");
     if (!result.found) {
@@ -233,6 +341,7 @@ void TestRandomThreeByThreeAndThreeByFour() {
     std::uniform_int_distribution<int> colsDistribution(3, 4);
     std::bernoulli_distribution nonZero(0.45);
     std::uniform_int_distribution<int> degreeDistribution(1, 4);
+    DifferentialCoverage coverage;
 
     for (int test = 0; test < 3000; ++test) {
         const int rows = rowsDistribution(generator);
@@ -250,11 +359,13 @@ void TestRandomThreeByThreeAndThreeByFour() {
         // Each iteration exercises a fresh model and both feasibility outcomes;
         // the fixed seed makes an unexpected disagreement reproducible.
         CheckDifferentialCase(grid, "random differential " +
-                                         std::to_string(test));
+                                         std::to_string(test),
+                              &coverage);
         if (failures > 5) {
             return;
         }
     }
+    ExpectDifferentialCoverage(coverage, "3x3/3x4 random differential group");
 }
 
 // Plant a conflict-free edge set first, then derive connector degrees from it.
@@ -424,6 +535,7 @@ void TestSolverAgainstBruteForce() {
     std::uniform_int_distribution<int> cols(2, 4);
     std::bernoulli_distribution nonZero(0.45);
     std::uniform_int_distribution<int> degree(1, 4);
+    DifferentialCoverage coverage;
 
     for (int test = 0; test < 1000; ++test) {
         const int n = rows(generator);
@@ -448,6 +560,7 @@ void TestSolverAgainstBruteForce() {
         // This covers both feasible and infeasible generated instances.
         Expect(result.found == expected,
                "random model disagrees with brute-force result");
+        RecordDifferentialCoverage(result, &coverage);
         if (result.found) {
             // Random differential cases must also survive the independent
             // validator; a matching Boolean is insufficient if the constructed
@@ -463,26 +576,30 @@ void TestSolverAgainstBruteForce() {
             return;
         }
     }
+    ExpectDifferentialCoverage(coverage, "2x2/3x4 random differential group");
 }
 
 // Require both feasibility and evidence that the queue actually forced an edge.
 void TestForcedPropagation() {
-    // The top connectors demand 1, 2, 1. Selecting either horizontal edge leaves
-    // the middle connector needing its one remaining candidate.
-    // This fixture is small enough that the queue behavior is easy to inspect
-    // while still requiring two chained forced selections after the first edge.
+    // The first row demands 1, 2, 1, 2 and has two one-degree connectors below
+    // its final position. Selecting AB forces BC; the third connector then
+    // reaches its target and forces rejection of CD, leaving the fourth
+    // connector without enough remaining candidates.
     recover::Model model = BuildFromText(
-        "2 3\n"
-        "1 2 1\n"
-        "0 0 0\n");
+        "3 4\n"
+        "1 2 1 2\n"
+        "0 0 0 1\n"
+        "0 0 0 1\n");
     recover::Solver solver(model);
     const recover::SolveResult result = solver.Solve();
 
-    Expect(result.found, "forced-selection fixture must be solvable");
+    Expect(!result.found, "forced-propagation fixture must be infeasible");
     Expect(result.stats.propagationEvents > 0,
            "propagation queue must process changed endpoints");
     Expect(result.stats.forcedSelections > 0,
            "fixture must trigger forced selection");
+    Expect(result.stats.forcedRejections > 0,
+           "fixture must trigger forced rejection");
     // The assertion is intentionally statistic-based: a solver that merely
     // guesses the same answer without using the queue would fail this test.
 }
@@ -509,25 +626,65 @@ void TestConflictPropagation() {
     // selection, before the remaining degree equations fail.
 }
 
-// Exercise valid input, out-of-range degree rejection, and trailing-token
-// rejection. These tests separate malformed input from an infeasible instance.
+void ExpectReadFailure(const std::string& input, const std::string& message,
+                       const std::string& context) {
+    const recover::Grid original = {{7, 8}, {9, 10}};
+    recover::Grid grid = original;
+    std::string error;
+    std::istringstream stream(input);
+    Expect(!recover::ReadSingleCase(&stream, &grid, &error), context);
+    Expect(error == message,
+           context + ": expected '" + message + "', got '" + error + "'");
+    Expect(grid == original,
+           context + ": failed parsing must preserve the caller's grid");
+}
+
+// Cover the complete parser contract. Failed parsing is distinct from a
+// well-formed but infeasible puzzle, and must not publish a partial matrix.
 void TestParser() {
-    // Preserve the stated dimensions for a valid matrix.
     recover::Grid grid;
     std::string error;
     std::istringstream valid("2 3\n1 0 2\n0 3 0\n");
     Expect(recover::ReadSingleCase(&valid, &grid, &error), "valid input");
     Expect(grid.size() == 2 && grid[0].size() == 3, "grid dimensions");
 
-    // Degree 5 exceeds the four incident directions.
-    std::istringstream badDegree("2 2\n1 2\n3 5\n");
-    Expect(!recover::ReadSingleCase(&badDegree, &grid, &error),
-           "degree 5 must be rejected");
+    // Missing dimensions and non-numeric dimensions fail before allocation.
+    ExpectReadFailure("", "missing n or m", "empty input");
+    ExpectReadFailure("2", "missing n or m", "missing m");
+    ExpectReadFailure("x 3\n", "missing n or m", "non-numeric n");
 
-    // A second case or stray integer is not part of the required format.
-    std::istringstream extraToken("2 2\n1 0\n0 0\n7\n");
-    Expect(!recover::ReadSingleCase(&extraToken, &grid, &error),
-           "extra input token must be rejected");
+    // The statement requires both dimensions to be at least two and at most
+    // fifty. These four checks cover each side of that closed interval.
+    ExpectReadFailure("1 3\n1 1 1\n", "n and m must satisfy 2 <= n,m <= 50",
+                      "too few rows");
+    ExpectReadFailure("3 1\n1\n1\n1\n", "n and m must satisfy 2 <= n,m <= 50",
+                      "too few columns");
+    ExpectReadFailure("51 2\n", "n and m must satisfy 2 <= n,m <= 50",
+                      "too many rows");
+    ExpectReadFailure("2 51\n", "n and m must satisfy 2 <= n,m <= 50",
+                      "too many columns");
+
+    // A connector has at most four physical directions, so both endpoints of
+    // the legal degree range are meaningful edge cases.
+    ExpectReadFailure("2 2\n1 2\n3 -1\n",
+                      "every connector degree must be in [0, 4]",
+                      "negative degree");
+    ExpectReadFailure("2 2\n1 2\n3 5\n",
+                      "every connector degree must be in [0, 4]",
+                      "degree greater than four");
+
+    // Short input and non-numeric cells are distinct lexical failures even
+    // though both prevent construction of a complete matrix.
+    ExpectReadFailure("2 3\n1 0 2\n0 3\n", "grid is shorter than n*m",
+                      "short grid");
+    ExpectReadFailure("2 2\n1 x\n0 0\n", "grid is shorter than n*m",
+                      "non-numeric cell");
+
+    // Exactly one case is accepted. Rejecting trailing data prevents a second
+    // test case from being silently consumed as part of the first matrix.
+    ExpectReadFailure("2 2\n1 0\n0 0\n7\n",
+                      "extra token after the single test case",
+                      "trailing token");
 }
 
 // Check static construction without invoking Solver. Sample 3 tests long
@@ -550,6 +707,27 @@ void TestCandidateModel() {
     // Static feasibility is necessary but does not itself certify a solution.
     Expect(sample3.structurallyPossible, "sample 3 static feasibility");
 
+    int conflictEntries = 0;
+    for (int edgeId = 0; edgeId < sample3.CandidateEdgeCount(); ++edgeId) {
+        const recover::CandidateEdge& edge = sample3.edges[edgeId];
+        Expect(sample3.directionEdge[edge.u][edge.directionAtU] == edgeId,
+               "candidate direction index at u must be reciprocal");
+        Expect(sample3.directionEdge[edge.v][edge.directionAtV] == edgeId,
+               "candidate direction index at v must be reciprocal");
+
+        conflictEntries += static_cast<int>(
+            sample3.conflictEdges[edgeId].size());
+        for (int other : sample3.conflictEdges[edgeId]) {
+            const auto reverse = std::find(
+                sample3.conflictEdges[other].begin(),
+                sample3.conflictEdges[other].end(), edgeId);
+            Expect(reverse != sample3.conflictEdges[other].end(),
+                   "conflict adjacency must be symmetric");
+        }
+    }
+    Expect(conflictEntries == 2 * sample3.conflictPairCount,
+           "each conflict pair must appear once in each direction");
+
     // Sample 2 has odd total demand and fails before search.
     const recover::Model sample2 = BuildFromText(
         "5 6\n"
@@ -563,12 +741,76 @@ void TestCandidateModel() {
            "sample 2 total requested degree");
     Expect(!sample2.structurallyPossible,
            "odd total degree must be rejected statically");
+
+    // A zero matrix is a valid empty design rather than an infeasible input.
+    // It must not create phantom vertices, candidates, or conflicts.
+    const recover::Model empty = BuildFromText(
+        "2 2\n"
+        "0 0\n"
+        "0 0\n");
+    Expect(empty.vertexCount == 0 && empty.CandidateEdgeCount() == 0,
+           "empty grid must contain no vertices or candidates");
+    Expect(empty.conflictPairCount == 0 && empty.structurallyPossible,
+           "empty grid must be structurally feasible");
+
+    // An isolated connector has demand but no candidate edge. Per-vertex
+    // capacity can reject this before any component-level reasoning.
+    const recover::Model isolated = BuildFromText(
+        "2 2\n"
+        "1 0\n"
+        "0 0\n");
+    Expect(!isolated.structurallyPossible,
+           "isolated connector must fail the incident-capacity check");
+    Expect(isolated.impossibleReason.find("too few") != std::string::npos,
+           "isolated connector failure reason must identify capacity");
+
+    // Each row below forms one three-vertex path. Every vertex passes its local
+    // incident-capacity check, but each component has odd total demand. This
+    // specifically reaches the component-local parity test after global parity
+    // and per-vertex capacity have both passed.
+    const recover::Model componentParity = BuildFromText(
+        "3 6\n"
+        "1 1 1 0 0 0\n"
+        "0 0 0 1 1 1\n"
+        "0 0 0 0 0 0\n");
+    Expect(!componentParity.structurallyPossible,
+           "component-local odd demand must be rejected");
+    Expect(componentParity.impossibleReason.find("component") !=
+               std::string::npos,
+           "component parity failure reason must identify the component check; "
+           "got '" +
+               componentParity.impossibleReason + "'");
+
+    // Two degree-four endpoints share only one candidate edge, so the global
+    // candidate-count bound is insufficient even though the grid is rectangular.
+    const recover::Model tooFewCandidates = BuildFromText(
+        "2 2\n"
+        "4 0\n"
+        "4 0\n");
+    Expect(!tooFewCandidates.structurallyPossible,
+           "too few candidate edges must be rejected statically");
+
+    // BuildModel distinguishes malformed structural input from a valid but
+    // infeasible puzzle. These checks cover empty dimensions, ragged rows, a
+    // forbidden one-row grid, and a null output pointer.
+    recover::Model invalid;
+    std::string error;
+    Expect(!recover::BuildModel({}, &invalid, &error),
+           "empty model dimensions must be rejected");
+    Expect(!recover::BuildModel({{1, 2}, {3}}, &invalid, &error),
+           "ragged grid must be rejected");
+    Expect(!recover::BuildModel({{1, 2}}, &invalid, &error),
+           "one-row grid must be rejected");
+    Expect(!recover::BuildModel({{1, 0}, {0, 0}}, nullptr, &error),
+           "null model output must be rejected");
+    Expect(error == "null model output",
+           "null model output must report a concrete diagnostic");
 }
 
 // Cover parsing, validation, serialization round trips, and wrong-degree
 // rejection. A No Solution fixture checks recognition of the text marker only;
 // the marker is not treated as proof of global infeasibility.
-void TestOutputValidation() {
+void TestValidatorAcceptance() {
     // Validate the official Sample 1 witness.
     const recover::Model sample1 = BuildFromText(
         "5 6\n"
@@ -608,6 +850,18 @@ void TestOutputValidation() {
                recover::ValidationStatus::kValid,
            "print/validate round trip");
 
+    std::string windowsOutput = roundTrip.str();
+    std::string crlfOutput;
+    crlfOutput.reserve(windowsOutput.size() + 16);
+    for (char ch : windowsOutput) {
+        if (ch == '\n') {
+            crlfOutput.push_back('\r');
+        }
+        crlfOutput.push_back(ch);
+    }
+    ExpectValidation(sample1, crlfOutput, recover::ValidationStatus::kValid,
+                     "valid connector layout", "Windows CRLF output");
+
     // Sample 3 admits multiple answers; validate the published witness.
     const recover::Model sample3 = BuildFromText(
         "3 5\n"
@@ -634,22 +888,90 @@ void TestOutputValidation() {
     Expect(ValidateText(sample3, "No Solution\n").status ==
                recover::ValidationStatus::kNoSolution,
            "No Solution marker");
-    // Change the degree of the final connector from one to zero.
-    std::string wrongDegree =
+}
+
+// Exercise every rejection branch in the independent output validator. Exact
+// messages make a missing branch visible instead of accepting any failure.
+void TestValidatorRejections() {
+    // A two-connector row gives one candidate edge and a compact valid witness.
+    // Every negative case below changes one property so its rejection branch is
+    // reached without introducing unrelated failures first.
+    const recover::Model pair = BuildFromText(
+        "2 2\n"
+        "1 1\n"
+        "0 0\n");
+    const std::string validPair =
         "1 1 0 0 0 1\n"
-        "1 2 0 0 1 0\n"
-        "1 3 0 1 0 1\n"
-        "1 5 0 0 1 0\n"
-        "2 1 0 0 0 1\n"
-        "2 3 1 0 1 1\n"
-        "2 5 0 1 1 0\n"
-        "3 1 0 0 0 1\n"
-        "3 2 0 0 1 1\n"
-        "3 3 0 0 1 0\n"
-        "3 5 0 0 0 0\n";
-    Expect(ValidateText(sample3, wrongDegree).status ==
-               recover::ValidationStatus::kInvalid,
-           "wrong degree must fail");
+        "1 2 0 0 1 0\n";
+    ExpectValidation(pair, validPair, recover::ValidationStatus::kValid,
+                     "valid connector layout", "validator baseline pair");
+
+    // An empty stream is invalid for a non-empty model; an actual blank line is
+    // rejected separately because it represents explicit malformed formatting.
+    ExpectValidation(pair, "", recover::ValidationStatus::kInvalid,
+                     "empty output", "empty output");
+    ExpectValidation(pair, "\n", recover::ValidationStatus::kInvalid,
+                     "blank output line", "blank line");
+
+    // Edge whitespace is checked on the raw line before stream extraction,
+    // because formatted extraction would silently skip leading spaces.
+    ExpectValidation(pair, " 1 1 0 0 0 1\n1 2 0 0 1 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "leading or trailing whitespace", "leading whitespace");
+    ExpectValidation(pair, "1 1 0 0\n1 2 0 0 1 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "malformed connector line", "missing direction field");
+
+    // A seventh token cannot be ignored: doing so could disguise a malformed
+    // coordinate stream as a valid six-field connector line.
+    ExpectValidation(pair, "1 1 0 0 0 1 9\n1 2 0 0 1 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "extra token on connector line", "seventh token");
+    ExpectValidation(pair, "9 9 0 0 0 0\n1 2 0 0 1 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "connector coordinate out of range",
+                     "coordinate outside grid");
+
+    // The matrix contains a real connector only at (1,1) and (1,2). A line for
+    // (2,2) must be rejected before it can participate in graph reconstruction.
+    ExpectValidation(pair, "2 2 0 0 0 1\n1 1 0 0 0 1\n1 2 0 0 1 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "output contains a zero position", "output at a zero cell");
+    ExpectValidation(pair, "1 1 0 0 0 1\n1 1 0 0 0 1\n",
+                     recover::ValidationStatus::kInvalid, "duplicate connector",
+                     "duplicate connector");
+
+    // Vertex ids are assigned row-major, so the second connector cannot be
+    // emitted before the first even though both coordinates are individually
+    // valid.
+    ExpectValidation(pair, "1 2 0 0 1 0\n1 1 0 0 0 1\n",
+                     recover::ValidationStatus::kInvalid,
+                     "connectors are not in row-major order",
+                     "connectors out of order");
+    ExpectValidation(pair, "1 1 0 0 0 2\n1 2 0 0 1 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "direction flags must be 0 or 1",
+                     "non-binary direction");
+
+    // Omitting one connector leaves the model incomplete. This is distinct from
+    // an empty output, which fails before any connector has been parsed.
+    ExpectValidation(pair, "1 1 0 0 0 1\n",
+                     recover::ValidationStatus::kInvalid, "missing connector",
+                     "missing connector line");
+    ExpectValidation(pair, "1 1 0 0 0 1\n1 2 0 0 0 1\n",
+                     recover::ValidationStatus::kInvalid,
+                     "fence exists at only one endpoint",
+                     "one-sided fence");
+
+    // Both endpoints report degree one, but they do not acknowledge the same
+    // candidate edge, so the fenced segment is dangling at one end.
+    ExpectValidation(pair, "1 1 0 0 0 0\n1 2 0 0 0 0\n",
+                     recover::ValidationStatus::kInvalid,
+                     "wrong connector degree", "wrong exact degree");
+    ExpectValidation(pair, "No Solution\n1 1 0 0 0 1\n",
+                     recover::ValidationStatus::kInvalid,
+                     "extra content after No Solution",
+                     "content after No Solution");
 }
 
 // This witness has correct endpoint pairing and degree at all four connectors.
@@ -673,9 +995,9 @@ void TestIllegalCrossing() {
         "2 3 0 0 1 0\n"
         "3 2 1 0 0 0\n";
     // Reciprocal directions are consistent in both candidates.
-    Expect(ValidateText(crossing, layout).status ==
-               recover::ValidationStatus::kInvalid,
-           "fences crossing at an empty point must fail");
+    ExpectValidation(crossing, layout, recover::ValidationStatus::kInvalid,
+                     "selected fences cross at an empty cell",
+                     "fences crossing at an empty point");
     // A validator that only sums endpoint flags would incorrectly accept this
     // layout, so the failure specifically exercises the conflict graph.
 }
@@ -687,36 +1009,126 @@ void TestEmptyLayout() {
         "2 2\n"
         "0 0\n"
         "0 0\n");
-    const recover::ValidationResult result = ValidateText(empty, "");
     // The validator must accept this exact empty textual representation.
-    Expect(result.status == recover::ValidationStatus::kValid,
-           "all-zero grid accepts an empty layout");
+    ExpectValidation(empty, "", recover::ValidationStatus::kValid,
+                     "valid empty layout", "all-zero grid");
     // This is distinct from the No Solution marker: the input has a valid empty
     // realization, and no fabricated "No Solution" text is required.
 }
 
-}  // namespace
-
-int main() {
-    // Run independent groups in a deterministic order.
-    TestParser();
-    TestCandidateModel();
-    TestOutputValidation();
+void TestValidatorGroup() {
+    TestValidatorAcceptance();
+    TestValidatorRejections();
     TestIllegalCrossing();
     TestEmptyLayout();
-    TestSolverSamples();
+}
+
+void TestRandomDifferentialGroup() {
     TestSolverAgainstBruteForce();
+    TestRandomThreeByThreeAndThreeByFour();
+}
+
+void TestPropagationGroup() {
     TestForcedPropagation();
     TestConflictPropagation();
-    TestExhaustiveSmallGrids();
-    TestRandomThreeByThreeAndThreeByFour();
-    TestPlantedFeasibleLayouts();
-    TestRequiredEdgeCases();
+}
 
+}  // namespace
+
+namespace {
+
+struct TestGroup {
+    const char* name;
+    void (*run)();
+};
+
+// The registry order is also the full-suite execution order. Parser and model
+// groups run before solver groups so construction failures are reported before
+// they can turn into misleading search disagreements.
+//
+// exhaustive-small runs a smaller number of generated models than the random
+// group but covers every legal 2x2 and 2x3 matrix. random-differential uses
+// fixed seeds and a separate brute-force mask loop. planted starts from a
+// hidden valid edge set, while geometry contains hand-derived boundary cases.
+//
+// CTest invokes one name at a time. Keeping the dispatcher here avoids a second
+// test binary and ensures every granular entry exercises exactly the compiled
+// production library.
+constexpr TestGroup kTestGroups[] = {
+    {"parser", TestParser},
+    {"model", TestCandidateModel},
+    {"validator", TestValidatorGroup},
+    {"samples", TestSolverSamples},
+    {"exhaustive-small", TestExhaustiveSmallGrids},
+    {"random-differential", TestRandomDifferentialGroup},
+    {"planted", TestPlantedFeasibleLayouts},
+    {"propagation", TestPropagationGroup},
+    {"geometry", TestRequiredEdgeCases},
+};
+
+// Print the same registry used for dispatch. This makes an unknown group easy
+// to diagnose without maintaining a second hard-coded help list.
+void PrintTestGroupList(std::ostream* output) {
+    *output << "Test groups:\n";
+    for (const TestGroup& group : kTestGroups) {
+        *output << "  " << group.name << '\n';
+    }
+}
+
+// A linear lookup is sufficient for nine groups and keeps the dispatcher
+// allocation-free.
+const TestGroup* FindTestGroup(const std::string& name) {
+    for (const TestGroup& group : kTestGroups) {
+        if (name == group.name) {
+            return &group;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    // Reject ambiguous multi-group invocations instead of silently running only
+    // the first argument. CTest always supplies at most one group name.
+    if (argc > 2) {
+        std::cerr << "Usage: recover_tests [--list|<group>]\n";
+        PrintTestGroupList(&std::cerr);
+        return 2;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--list") {
+        PrintTestGroupList(&std::cout);
+        return 0;
+    }
+
+    if (argc == 1) {
+        // Preserve the original developer workflow: no arguments runs every
+        // group, while CTest uses the named path for better failure isolation.
+        for (const TestGroup& group : kTestGroups) {
+            group.run();
+        }
+        if (failures != 0) {
+            std::cerr << failures << " test(s) failed\n";
+            return 1;
+        }
+        std::cout << "All model, solver, and validation tests passed\n";
+        return 0;
+    }
+
+    const TestGroup* selected = FindTestGroup(argv[1]);
+    // Unknown names are usage errors (status 2), distinct from assertion
+    // failures (status 1) and successful test completion (status 0).
+    if (selected == nullptr) {
+        std::cerr << "Unknown test group: " << argv[1] << '\n';
+        PrintTestGroupList(&std::cerr);
+        return 2;
+    }
+    selected->run();
     if (failures != 0) {
-        std::cerr << failures << " test(s) failed\n";
+        std::cerr << failures << " test(s) failed in group "
+                  << selected->name << '\n';
         return 1;
     }
-    std::cout << "All model and validation tests passed\n";
+    std::cout << "Test group passed: " << selected->name << '\n';
     return 0;
 }

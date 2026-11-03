@@ -106,7 +106,9 @@ stress tests.
 ## Validation status
 
 - Debug and Release builds pass without compiler warnings.
-- The CTest suite covers the official samples, all 2×2 and 2×3 degree
+- CTest exposes nine independently runnable correctness groups plus ten
+  black-box CLI tests. It covers parsing failures, candidate-model invariants,
+  Validator rejection branches, official samples, all 2×2 and 2×3 degree
   matrices, 4,000 randomized differential cases, planted feasible layouts,
   propagation statistics, conflicts, and required geometric edge cases.
 - Every constructed answer is checked again by the independent validator.
@@ -130,6 +132,12 @@ Get-Content tests\samples\sample1.in | .\build\Release\recover.exe
 The submitted program reads one test case from standard input and writes either
 the connector states or `No Solution` to standard output.
 
+Run the fast correctness suite:
+
+```powershell
+ctest --test-dir build -C Release -L correctness --output-on-failure
+```
+
 Validate an existing answer:
 
 ```powershell
@@ -146,6 +154,14 @@ Run the internal benchmark executable:
 
 ```powershell
 .\build\Release\recover_benchmark.exe --repeat 5 data\generated\...\*.in
+```
+
+Register and run the full deterministic performance corpus as an optional
+CTest when Python 3 is available:
+
+```powershell
+cmake -S . -B build -DADS_PROJ3_ENABLE_PERFORMANCE_TESTS=ON
+ctest --test-dir build -C Release -L performance --output-on-failure
 ```
 
 Check the submitted comment language and density before committing:

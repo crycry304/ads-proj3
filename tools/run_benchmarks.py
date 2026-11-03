@@ -20,6 +20,16 @@ METRIC_FIELDS = [
     "max_depth",
 ]
 
+STABLE_FIELDS = [
+    "n",
+    "m",
+    "connectors",
+    "candidate_edges",
+    "conflict_pairs",
+    "found",
+    *METRIC_FIELDS,
+]
+
 
 def run_case(executable: Path, input_path: Path, repeat: int,
              timeout: float) -> tuple[str, list[dict[str, str]], str]:
@@ -42,6 +52,20 @@ def run_case(executable: Path, input_path: Path, repeat: int,
     rows = list(reader)
     if not rows:
         return "error", [], "benchmark produced no CSV rows"
+    if len(rows) != repeat:
+        return (
+            "error",
+            [],
+            f"expected {repeat} repetitions, received {len(rows)}",
+        )
+    for field in STABLE_FIELDS:
+        values = {row.get(field, "") for row in rows}
+        if len(values) != 1:
+            return (
+                "error",
+                [],
+                f"non-deterministic {field}: {sorted(values)}",
+            )
     return "pass", rows, ""
 
 
