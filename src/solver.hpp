@@ -8,107 +8,119 @@
 
 namespace recover {
 
-// 搜索统计用于比较后续剪枝版本的收益。
-// nodes 表示进入过一次递归的搜索节点数；
-// backtracks 表示一个局部组合失败并撤销的次数；
-// maximumDepth 表示递归访问到的最大连接器层数。
+// Search statistics expose the cost of search and propagation for experiments.
+// Nodes count recursive entries; backtracks count failed and rolled-back nodes.
 struct SearchStats {
-    // 每次进入 Search 时为 nodes 加一，即使该节点立即失败也算访问过。
+    // Increment for every Search call, including nodes that fail immediately.
     std::uint64_t nodes = 0;
 
-    // 只有当前节点的所有局部组合都失败后才计入一次 backtrack。
+    // Count a node after all of its completion subsets have failed.
     std::uint64_t backtracks = 0;
 
-    // 从事件队列取出并重新检查的连接器次数。
-    // 同一个连接器可能因多次状态变化而多次入队。
+    // Number of connector inspections consumed from the propagation queue.
+    // A connector may be queued more than once as adjacent states change.
     std::uint64_t propagationEvents = 0;
 
-    // 传播过程中由“已经满足度数”规则强制拒绝的边数。
+    // Unknown edges rejected because their endpoint is already satisfied.
     std::uint64_t forcedRejections = 0;
 
-    // 传播过程中由“剩余边必须全选”规则强制选择的边数。
+    // Unknown edges selected because all remaining choices are required.
     std::uint64_t forcedSelections = 0;
 
-    // 因为与已选边在空白格交叉而被自动拒绝的边数。
+    // Edges rejected after conflicting with an already selected edge.
     std::uint64_t conflictRejections = 0;
 
-    // 统计实际递归深度，用于后续比较固定顺序和 MRV。
+    // Deepest connector decision layer reached by the search.
     int maximumDepth = 0;
 };
 
-// found=true 表示找到了方向数组；
-// found=false 表示完整搜索结束后没有合法布局。
+// found distinguishes a constructive answer from a completed infeasibility proof.
 struct SolveResult {
-    // found 是搜索结论：false 表示完整搜索后确实没有解。
+    // False means the exhaustive search finished without finding a layout.
     bool found = false;
 
-    // 找到解时按内部顶点编号保存四方向。
+    // Direction flags indexed by internal vertex id when found is true.
     std::vector<std::array<int, 4>> directions;
 
-    // 即使无解，这些统计也可用于报告和性能比较。
+    // Statistics remain available for both feasible and infeasible instances.
     SearchStats stats;
 };
 
-// 当前求解器采用完备回溯、事件队列传播和 MRV 变量排序。
-// Git 历史中的无传播版本用于比较搜索节点数。
+// The solver combines complete backtracking, queued propagation, and MRV
+// variable ordering. Earlier Git revisions provide comparison baselines.
 //
-// Solver 对象的生命周期只覆盖一次 Solve 调用。
-// 当前不设计“复用上一次部分状态”的接口，
-// 以避免不同测试用例之间的旧状态污染。
-// 如果需要重复求解，应新建 Solver 或用新 Model 重新构造。
+// A search node stores a three-way assignment for every candidate edge. The
+// assignment is partial: kUnknown means that a future branch may still choose
+// the edge, while kSelected and kRejected are fixed on the current path. The
+// solver never changes the static Model, so branching state consists only of
+// edgeStates_, the two degree counters, the queue, and the rollback trail.
+//
+// The queue is an incremental consistency mechanism rather than a second search
+// engine. AssignEdge queues an edge's endpoints, and Propagate repeatedly
+// applies the two exact-degree implications until no counter changes. Rollback
+// restores the counter and trail snapshots after a failed child and starts the
+// next child with an empty event queue.
+//
+// MRV is a heuristic variable-ordering rule over connectors. It can reduce the
+// number of visited nodes, but it does not make node counts monotone across
+// every input and its conflict-weight scan has a small per-node cost. The
+// benchmark comparison therefore reports both tree size and elapsed time rather
+// than assuming that fewer local choices always imply a faster run.
+//
+// A Solver is intended for one Solve call. Reusing partially explored state
+// would make test isolation fragile; construct a fresh Solver for a new model.
 class Solver {
 public:
-    // Solver 只读取 Model，不修改静态候选图。
+    // The model reference is immutable during search.
     explicit Solver(const Model& model);
 
-    // 返回首个合法解或完整的无解结论。
+    // Return the first valid layout, or prove that no layout exists.
     SolveResult Solve();
 
 private:
-    // 下面的私有接口共同维护三态回滚和局部组合探索。
-    // 公共调用者只能看到最终 SolveResult，
-    // 不应依赖搜索过程中的边编号或修改顺序。
-    // UNKNOWN：当前分支尚未决定；
-    // REJECTED：当前分支确定不选；
-    // SELECTED：当前分支确定选择。
+    // Private methods maintain edge states, rollback, and local completion
+    // subsets. Callers depend only on SolveResult, not internal edge ids.
+    // UNKNOWN: not decided on the current branch;
+    // REJECTED: confirmed absent on the current branch;
+    // SELECTED: confirmed present on the current branch.
     enum EdgeState : std::uint8_t {
         kUnknown = 0,
         kRejected = 1,
         kSelected = 2,
     };
 
-    // 回溯栈只记录一次 UNKNOWN -> REJECTED/SELECTED 的变化。
+    // Each trail entry records one UNKNOWN-to-decided transition.
     struct TrailEntry {
-        // edgeId 是被修改的候选边。
+        // Candidate edge whose state changed.
         int edgeId = -1;
 
-        // previousState 在回溯时恢复；当前每条边只会从 UNKNOWN 进入确定状态。
+        // State restored during rollback; currently always kUnknown.
         EdgeState previousState = kUnknown;
     };
 
-    // 一个分支需要决定某个连接器的完整局部选择。
+    // A branch fills one connector's remaining degree with a subset of its
+    // currently unknown candidate edges.
     struct BranchChoice {
-        // vertex 是本次局部选择的连接器。
+        // True when no legal degree-completing subset exists.
+        bool impossible = false;
+
+        // Connector chosen as the variable for this node.
         int vertex = -1;
 
-        // need 是该连接器还缺少的度数。
+        // Remaining degree at vertex.
         int need = 0;
 
-        // availableEdges 只包含当前仍为 UNKNOWN 的关联候选边。
+        // Incident candidates that are still unknown.
         std::vector<int> availableEdges;
 
-        // 当前连接器在现有状态下有多少个局部组合。
-        // 形式为 C(availableEdges.size(), need)；
-        // 该值越小，MRV 越优先选择这个连接器。
+        // Number of completion subsets: C(availableEdges.size(), need).
         int combinationCount = 0;
 
-        // 所有未知关联边的冲突次数之和。
-        // 只在 combinationCount 相同时作为第二关键字。
+        // Sum of conflict degrees, used as a deterministic MRV tie-breaker.
         int conflictWeight = 0;
     };
 
     bool AssignEdge(int edgeId, EdgeState newState);
-    bool HasSelectedConflict(int edgeId) const;
     bool Propagate();
     BranchChoice ChooseBranch();
     bool Search(int depth);
@@ -123,26 +135,27 @@ private:
 
     const Model& model_;
 
-    // edgeStates_ 的长度固定等于候选边数，下标就是全局边编号。
+    // Indexed by stable candidate-edge id.
     std::vector<EdgeState> edgeStates_;
 
-    // selectedDegree_ 的长度固定等于连接器数，只统计 SELECTED。
+    // Number of selected incident candidates for each connector.
     std::vector<int> selectedDegree_;
 
-    // unknownDegree_[v] 表示 v 的关联候选边中仍为 UNKNOWN 的数量。
-    // selected + unknown < required 时可以立即判定当前分支失败。
+    // Number of unknown incident candidates. If selected + unknown is below the
+    // required degree, the current branch cannot be completed.
     std::vector<int> unknownDegree_;
 
-    // 增量传播的事件队列。
-    // 某个端点状态变化后将连接器放入 pendingVertices_，
-    // 直到队列消费完毕，所有可推导的强制状态都已处理。
+    // FIFO event queue. Both endpoints of a changed edge are queued, and entries
+    // are consumed until propagation reaches a fixed point. Entries are vertex
+    // ids because a change in either incident edge can alter the same degree
+    // equations. They are not candidate ids and need not be unique.
     std::vector<int> pendingVertices_;
     std::size_t pendingHead_ = 0;
 
-    // trail_ 是当前递归路径上的增量修改记录。
+    // Incremental state changes along the current search path.
     std::vector<TrailEntry> trail_;
 
-    // result_ 同时保存答案和搜索统计，随递归过程累积。
+    // Accumulates the answer and statistics during recursive search.
     SolveResult result_;
 };
 

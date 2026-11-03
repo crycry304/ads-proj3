@@ -9,41 +9,37 @@
 
 namespace recover {
 
-// 验证器与求解器完全解耦。
-// 求解器可能依赖内部边状态和搜索痕迹，但验证器只接受：
-// 1. 由输入构建出的 Model；
-// 2. 一份文本答案。
-// 它重新计算连接器度数、栅栏端点和交叉关系，可以独立发现求解器错误。
+// The validator is deliberately independent of solver internals.
+// It receives only the input-derived Model and a textual candidate answer.
+// It recomputes degrees, endpoint agreement, ordering, and crossings.
 //
-// ValidationResult 的设计：
-// - status 给调用者做程序分支；
-// - message 给人和测试日志阅读；
-// - directions 只在合法时使用，保存解析后的结构化答案。
-// 调用者不应根据 message 字符串判断状态，而应使用 status。
+// ValidationResult separates machine control, feedback, and reconstructed data:
+// status drives program logic, message is human-readable, and directions are
+// returned only for a valid layout.
 
-// kValid 表示构造出了合法布局；kNoSolution 只表示输出文本声称无解。
+// kNoSolution recognizes a claim only; it is not a proof of infeasibility.
 enum class ValidationStatus {
-    // 答案已经逐项验证通过。
+    // The candidate layout passed every constraint.
     kValid,
 
-    // 答案文本是 No Solution，但仅凭该文本无法证明实例真的无解。
+    // The text says No Solution; absence itself is proved by the solver.
     kNoSolution,
 
-    // 格式、度数、端点配对或交叉关系至少有一项不合法。
+    // At least one format, degree, endpoint, or conflict rule failed.
     kInvalid,
 };
 
-// 验证成功后同时返回方向数组，便于测试输出模块的往返一致性。
+// A valid result also returns the parsed directions for round-trip testing.
 struct ValidationResult {
-    // status 决定调用方的处理方式；message 提供可读错误原因。
+    // Machine-readable outcome and a concise diagnostic explanation.
     ValidationStatus status = ValidationStatus::kInvalid;
     std::string message;
 
-    // 只在 kValid 时填充，供其他测试再次打印或比较。
+    // Populated only for kValid.
     std::vector<std::array<int, 4>> directions;
 };
 
-// 验证器只读取输入模型和候选输出，不依赖求解器的内部搜索状态。
+// Validate without reading selected/rejected arrays from the solver.
 ValidationResult ValidateOutput(const Model& model, std::istream* output);
 
 }  // namespace recover

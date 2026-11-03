@@ -15,64 +15,62 @@
 
 namespace {
 
-// 测试程序直接链接生产模块，不复制一套“测试专用算法”。
-// 因此这里发现的问题就是实际源码中的问题。
+// Tests link directly against the production modules, so a failure here is a
+// failure in the submitted implementation rather than a parallel test model.
 //
-// 当前测试分四层：
-// 1. 输入解析：合法、越界、额外 token；
-// 2. 候选模型：顶点数、候选边数、冲突数、静态可行性；
-// 3. 答案格式：题目两个合法输出、打印往返、错误度数；
-// 4. 特殊边界：非法交叉和全零空设计。
+// Coverage has four layers: input parsing, static candidate construction,
+// output serialization/validation, and geometric edge cases.
 //
-// 两套独立的解存在性判断：
-// - BruteForceExists 枚举候选边子集，作为小规模测试真值；
-// - Solver 使用完整回溯、传播和 MRV。
-// 只有两者在所有可承受的输入上结论一致，优化后的求解器才可信。
+// Feasibility is cross-checked by two independent methods: BruteForceExists
+// enumerates candidate-edge subsets on small instances, while Solver uses
+// complete backtracking with propagation and MRV. They must agree.
 //
-// 验证不依赖具体答案文本，因为题目允许多解。
-// 对每个找到的解，只检查它是否满足输入规定的全部约束。
-// 无解样例则单独检查求解器是否完整搜索后返回 false。
+// Validation checks constraints rather than one fixed answer because multiple
+// layouts may be valid. Random tests use fixed seeds so failures reproduce.
 //
-// 随机测试全部使用固定 seed，保证 CI 和本地测试可重复。
-// 若测试失败，context 会指出具体测试组和序号。
+// The brute-force oracle is deliberately written in a different style from the
+// solver: it selects a complete subset mask, checks conflicts among that subset,
+// and compares all degrees afterward. The solver instead grows a partial state
+// and propagates local implications. Agreement therefore tests more than two
+// implementations sharing the same control flow.
+//
+// For a model with E candidates, the oracle tries 2^E masks. It is restricted to
+// E <= 20 so the exhaustive tests remain practical. The solver has no such test
+// cutoff; the oracle is only a source of ground truth for small instances.
 
-// 测试失败不会立即终止进程，而是累计失败数，
-// 这样一次运行可以同时暴露多个约束或格式问题。
-
-// 所有测试共享失败计数，最后统一决定进程退出码。
+// Accumulate failures to report multiple issues in one run.
 int failures = 0;
 
-// 条件不成立时打印具体测试目的，便于直接定位失败模块。
+// Report the purpose of a failed assertion before continuing.
 void Expect(bool condition, const std::string& message) {
     if (!condition) {
-        // 某个断言失败后继续运行，方便一次看到多个问题。
         std::cerr << "FAIL: " << message << '\n';
         ++failures;
     }
 }
 
-// 把字符串输入转换成完整模型，减少测试中的重复样板代码。
+// Parse a text fixture and construct its static model.
 recover::Model BuildFromText(const std::string& text) {
     std::istringstream input(text);
     recover::Grid grid;
     std::string error;
     Expect(recover::ReadSingleCase(&input, &grid, &error), error);
 
-    // 输入解析和模型构造是两个独立阶段。
+    // Parsing and model construction are independently checked stages.
     recover::Model model;
     Expect(recover::BuildModel(grid, &model, &error), error);
     return model;
 }
 
-// 调用独立的输出验证器检查候选答案。
+// Validate a candidate answer through the production validator.
 recover::ValidationResult ValidateText(const recover::Model& model,
                                        const std::string& text) {
     std::istringstream output(text);
     return recover::ValidateOutput(model, &output);
 }
 
-// 小规模暴力搜索只枚举候选边子集。
-// 它不依赖正式 Solver 的递归结构，因此适合作为独立真值来源。
+// Enumerate candidate-edge subsets without using any Solver decision order.
+// This provides an independent feasibility oracle for small models.
 bool BruteForceExists(const recover::Model& model) {
     const int edgeCount = model.CandidateEdgeCount();
     if (edgeCount > 20) {
@@ -81,9 +79,12 @@ bool BruteForceExists(const recover::Model& model) {
 
     const std::uint64_t limit = std::uint64_t{1} << edgeCount;
     const int targetEdges = model.totalRequiredDegree / 2;
+    // The target-edge count is a quick rejection criterion: every selected edge
+    // contributes two degree units. Degree and conflict checks are still needed
+    // because the count alone is not sufficient.
 
     for (std::uint64_t mask = 0; mask < limit; ++mask) {
-        // 只需要枚举恰好选择一半总度数的子集。
+        // A valid layout must select exactly half of the total degree.
         if (static_cast<int>(std::bitset<64>(mask).count()) != targetEdges) {
             continue;
         }
@@ -115,7 +116,7 @@ bool BruteForceExists(const recover::Model& model) {
         if (!valid) {
             continue;
         }
-        // 掩码中的边都不冲突后，再统一检查所有顶点的精确度数。
+        // Conflict-free selection still needs exact degree checks everywhere.
         for (int v = 0; v < model.vertexCount; ++v) {
             if (degree[v] != model.requiredDegree[v]) {
                 valid = false;
@@ -123,7 +124,7 @@ bool BruteForceExists(const recover::Model& model) {
             }
         }
         if (valid) {
-            // 暴力枚举只需要判断是否存在，找到第一个就立即返回。
+            // Feasibility requires only one witness.
             return true;
         }
     }
@@ -138,14 +139,14 @@ void TestSolverAndValidation(const std::vector<std::vector<int>>& grid,
 
     recover::Solver solver(model);
     const recover::SolveResult result = solver.Solve();
-    // 有解/无解结论先与样例预期比较。
+    // Compare the solver conclusion with the fixture expectation.
     Expect(result.found == expectedFound, "solver solvability mismatch");
     if (!result.found) {
-        // 无解样例没有方向数组可供验证，只比较预期结论。
+        // No constructive answer exists to validate in this case.
         return;
     }
 
-    // 有解时用正式 IO 生成文本，再走独立 Validator。
+    // Serialize a constructive answer and validate it independently.
     std::ostringstream output;
     recover::PrintDirections(model, result.directions, &output);
     Expect(ValidateText(model, output.str()).status ==
@@ -153,18 +154,20 @@ void TestSolverAndValidation(const std::vector<std::vector<int>>& grid,
            "solver output must pass independent validation");
 }
 
-// 对拍入口依次完成建模、暴力真值计算、正式求解和最终答案验证。
-// context 用于在失败时指出具体尺寸和序号，便于直接复现。
+// Compare Solver with the brute-force oracle, then validate every witness.
+// context identifies the grid size and deterministic fixture on failure.
 void CheckDifferentialCase(const std::vector<std::vector<int>>& grid,
                            const std::string& context) {
-    // 对拍函数先从输入重新构建模型，再用独立候选边子集枚举判断真值。
+    // Build from the input before computing either conclusion.
     recover::Model model;
     std::string error;
     Expect(recover::BuildModel(grid, &model, &error),
            context + ": " + error);
 
-    // expected 完全由 BruteForceExists 决定，不读取 Solver 的搜索痕迹。
+    // The oracle must not depend on any solver trace.
     const bool expected = BruteForceExists(model);
+    // If the oracle finds a witness, the solver must also find one; if the
+    // solver fails, this assertion makes the disagreement immediately visible.
     recover::Solver solver(model);
     const recover::SolveResult result = solver.Solve();
     Expect(result.found == expected,
@@ -181,29 +184,29 @@ void CheckDifferentialCase(const std::vector<std::vector<int>>& grid,
            context + ": " + validation.message);
 }
 
-// 完整穷举 2x2 和 2x3 的所有度数矩阵。
-// 这比随机抽样更严格：输入空间中的每个点都会被检查一次。
+// Exhaust every 2x2 and 2x3 degree matrix in the legal input space.
 void TestExhaustiveSmallGrids() {
-    // 每个格子独立取 0..4。2x3 只有 5^6=15625 种输入，
-    // 可以直接与候选边子集暴力枚举逐项对拍。
+    // Each cell ranges over 0..4; 2x3 has only 5^6 = 15,625 instances.
     for (const auto& dimensions : std::vector<std::pair<int, int>>{
              {2, 2}, {2, 3}}) {
         const int rows = dimensions.first;
         const int cols = dimensions.second;
-        // 使用五进制编码逐项生成所有度数矩阵。
+        // Encode the whole matrix as a base-5 counter.
         const int cells = rows * cols;
-        // 计算 5^(rows*cols)，作为所有度数矩阵的五进制编号上界。
+        // Compute the number of encoded matrices.
+        // The integer is small enough for the fixed test set; this is an
+        // enumeration counter, not a bound derived from arbitrary input.
         int total = 1;
         for (int i = 0; i < cells; ++i) {
             total *= 5;
         }
 
         for (int code = 0; code < total; ++code) {
-            // 把当前编号拆成每个格子的 0..4 度数。
+            // Decode one cell at a time.
             int value = code;
             std::vector<std::vector<int>> grid(
                 rows, std::vector<int>(cols, 0));
-            // 五进制数字的每一位对应一个格子的度数 0..4。
+            // Each base-5 digit is one connector degree.
             for (int r = 0; r < rows; ++r) {
                 for (int c = 0; c < cols; ++c) {
                     grid[r][c] = value % 5;
@@ -215,17 +218,16 @@ void TestExhaustiveSmallGrids() {
                           std::to_string(cols) + " code " +
                           std::to_string(code));
             if (failures > 5) {
-                // 同类错误已经很多时提前结束，保留可读的测试输出。
+                // Stop after repeated failures to keep diagnostics readable.
                 return;
             }
         }
     }
 }
 
-// 3x3 和 3x4 的候选边最多约 14 条，
-// 因此仍可通过候选边子集暴力枚举得到可靠真值。
+// The 3x3 and 3x4 instances have few enough candidates for subset enumeration.
 void TestRandomThreeByThreeAndThreeByFour() {
-    // 3×4 最多约 14 条候选边，仍可承受 2^14 子集枚举。
+    // A 3x4 grid has at most about 14 candidates, so 2^14 enumeration is cheap.
     std::mt19937 generator(20261103U);
     std::uniform_int_distribution<int> rowsDistribution(3, 3);
     std::uniform_int_distribution<int> colsDistribution(3, 4);
@@ -237,7 +239,7 @@ void TestRandomThreeByThreeAndThreeByFour() {
         const int cols = colsDistribution(generator);
         std::vector<std::vector<int>> grid(
             rows, std::vector<int>(cols, 0));
-        // 每格先决定是否出现连接器，再生成 1..4 的目标度数。
+        // First choose connector presence, then an occupied degree.
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
                 if (nonZero(generator)) {
@@ -245,6 +247,8 @@ void TestRandomThreeByThreeAndThreeByFour() {
                 }
             }
         }
+        // Each iteration exercises a fresh model and both feasibility outcomes;
+        // the fixed seed makes an unexpected disagreement reproducible.
         CheckDifferentialCase(grid, "random differential " +
                                          std::to_string(test));
         if (failures > 5) {
@@ -253,18 +257,19 @@ void TestRandomThreeByThreeAndThreeByFour() {
     }
 }
 
-// 先构造一个无冲突的合法布局，再由它反推出每个格子的度数。
-// 因此这些输入按构造必然有解，Solver 不应输出 No Solution。
+// Plant a conflict-free edge set first, then derive connector degrees from it.
+// These instances are feasible by construction, so the solver must never report
+// No Solution for one of them.
 void TestPlantedFeasibleLayouts() {
-    // 先在正数掩码上随机选择一个无冲突边集合，
-    // 再由该集合反算每个连接器的度数。
-    // 因此构造出的输入一定存在解，可用于检查“误报无解”。
+    // The hidden edge set is a witness that the generated input is feasible.
+    // Unlike arbitrary random grids, this family isolates the specific error
+    // mode of rejecting an instance merely because search pruning is too strong.
     std::mt19937 generator(20261104U);
     std::uniform_int_distribution<int> sizeDistribution(3, 6);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
 
     for (int test = 0; test < 200; ++test) {
-        // 随机选择矩阵尺寸和正数位置密度。
+        // Vary dimensions and connector density deterministically.
         const int rows = sizeDistribution(generator);
         const int cols = sizeDistribution(generator);
         const double density = unit(generator);
@@ -277,27 +282,29 @@ void TestPlantedFeasibleLayouts() {
             }
         }
 
-        // 先用占位度数 1 建立候选图，只借助它取得边长和冲突关系。
+        // Build with placeholder degrees to obtain candidate geometry.
         recover::Model base;
         std::string error;
         Expect(recover::BuildModel(mask, &base, &error), error);
         if (base.CandidateEdgeCount() == 0) {
-            // 没有候选边就没有可供种植的合法栅栏，跳过空案例。
+            // No candidates means there is no hidden fence to plant.
             continue;
         }
 
-        // 打乱候选边，随后贪心选择无冲突子集作为隐藏的可行设计方案。
+        // Random order prevents the planted set from following candidate ids.
         std::vector<int> order(base.CandidateEdgeCount());
         for (int i = 0; i < base.CandidateEdgeCount(); ++i) {
             order[i] = i;
         }
         std::shuffle(order.begin(), order.end(), generator);
+        // Starting from candidate ids alone would bias the planted layout
+        // toward the solver's construction order, so shuffle the selection order.
 
         std::vector<bool> selected(base.CandidateEdgeCount(), false);
         std::vector<int> vertexDegree(base.vertexCount, 0);
-        // 隐藏方案中每条选边给两端各增加 1 度。
+        // Each planted edge contributes one degree at both endpoints.
         for (int edgeId : order) {
-            // 约 55% 的候选边进入隐藏方案；冲突边则直接跳过。
+            // Include roughly 55 percent unless a crossing makes it illegal.
             if (unit(generator) > 0.55) {
                 continue;
             }
@@ -309,7 +316,7 @@ void TestPlantedFeasibleLayouts() {
                 }
             }
             if (conflicts) {
-                // 与已选边交叉的候选边不能加入隐藏方案。
+                // Never place two conflicting edges in the hidden layout.
                 continue;
             }
             selected[edgeId] = true;
@@ -318,7 +325,7 @@ void TestPlantedFeasibleLayouts() {
             ++vertexDegree[edge.v];
         }
 
-        // 将隐藏方案的端点度数写回矩阵，零度位置改回 0。
+        // Materialize the planted degrees into the input matrix.
         std::vector<std::vector<int>> grid(
             rows, std::vector<int>(cols, 0));
         bool any = false;
@@ -327,54 +334,55 @@ void TestPlantedFeasibleLayouts() {
             any = any || vertexDegree[v] > 0;
         }
         if (any) {
-            // 隐藏方案至少含一条边，因此生成输入必然存在解。
+            // At least one edge was planted, so a witness exists.
             TestSolverAndValidation(grid, true);
         }
     }
 }
 
-// 覆盖题目最容易误判的几何和计数边界。
-// 每个 TestSolverAndValidation 的第二个参数是预期是否存在解。
+// Cover geometric and counting boundaries that are easy to misinterpret.
+// The second argument states whether a layout must exist.
 void TestRequiredEdgeCases() {
-    // 单连接器没有另一端，不能形成栅栏。
+    // A lone connector has no partner.
     TestSolverAndValidation({{1, 0}, {0, 0}}, false);
 
-    // 相邻的左右两点各需要一条边，必须直通。
+    // Adjacent horizontal connectors require the segment between them.
     TestSolverAndValidation({{1, 1}, {0, 0}}, true);
 
-    // 相邻的上下两点各需要一条边。
+    // The same applies to adjacent vertical connectors.
     TestSolverAndValidation({{1, 0}, {1, 0}}, true);
 
-    // 跨越中间零位置的一条长水平边。
+    // One long horizontal segment spans two empty cells.
     TestSolverAndValidation({{1, 0, 0, 1}, {0, 0, 0, 0}}, true);
 
-    // 中心连接四个方向，形成四向分叉。
-    // 四条臂各自只要求 1 度，因此唯一完成方式是全部与中心相连。
+    // A four-way connector joins four one-degree arms.
+    // This distinguishes a turnaround at a connector from an illegal crossing
+    // through an empty cell, which is covered separately below.
     TestSolverAndValidation(
         {{0, 1, 0}, {1, 4, 1}, {0, 1, 0}}, true);
 
-    // 只保留三个方向的 T 形连接器。
-    // 缺少下侧候选边时，中心度数 3 正好对应上、左、右三条边。
+    // A three-way connector uses its up, left, and right candidates.
     TestSolverAndValidation(
         {{0, 1, 0}, {1, 3, 1}, {0, 0, 0}}, true);
 
-    // 两个互不相连的合法分量。
-    // 题目不要求所有连接器属于同一个栅栏，因此分开的两条边也合法。
+    // Separate valid components are allowed; the problem does not require one
+    // connected fence system.
+    // The two small components exercise the component-local parity check rather
+    // than a global total alone.
     TestSolverAndValidation(
         {{1, 1, 0, 1, 1}, {0, 0, 0, 0, 0}}, true);
 
-    // 边界格只有两个方向，需求 4 条边必然不可能。
+    // A corner connector has only two directions but demands four.
     TestSolverAndValidation({{4, 0}, {0, 0}}, false);
 
-    // 总度数为奇数，候选图再好也无法两两配对。
-    // 每条边贡献 2 度，因此三条需求边无法闭合成合法选边集合。
+    // Odd total demand cannot be formed by degree contributions of two.
     TestSolverAndValidation({{1, 1, 0}, {1, 0, 0}}, false);
 }
 
-// 三个官方样例作为固定回归用例。
-// 答案可能不唯一，所以比较的是合法性而不是固定的输出字符串。
+// Keep all three official samples as fixed regressions. Solutions need not
+// match one stored string; every witness is checked for validity instead.
 void TestSolverSamples() {
-    // Sample 1 是普通可行实例，用于确认搜索能找到完整布局。
+    // Sample 1 is the ordinary feasible case.
     TestSolverAndValidation(
         {
             {0, 0, 2, 0, 0, 2},
@@ -385,7 +393,7 @@ void TestSolverSamples() {
         },
         true);
 
-    // Sample 2 的总度数为奇数，模型静态检查会直接拒绝。
+    // Sample 2 has odd total demand and must fail static validation.
     TestSolverAndValidation(
         {
             {0, 0, 2, 0, 0, 2},
@@ -396,7 +404,9 @@ void TestSolverSamples() {
         },
         false);
 
-    // Sample 3 含跨空白的候选段和一个交叉冲突。
+    // Sample 3 includes long segments and one empty-cell conflict.
+    // The published answer contains several rows, so this also checks that the
+    // serializer can represent a nontrivial row-major output order.
     TestSolverAndValidation(
         {
             {1, 1, 2, 0, 1},
@@ -406,10 +416,9 @@ void TestSolverSamples() {
         true);
 }
 
-// 固定种子的随机差异测试，覆盖 2x2 到 3x4。
-// 该组与后续 3x3/3x4 专项组互补。
+// Fixed-seed differential tests cover 2x2 through 3x4 grids.
 void TestSolverAgainstBruteForce() {
-    // 固定随机种子保证失败可以复现。
+    // A fixed seed makes every reported failure reproducible.
     std::mt19937 generator(20261102U);
     std::uniform_int_distribution<int> rows(2, 3);
     std::uniform_int_distribution<int> cols(2, 4);
@@ -433,25 +442,35 @@ void TestSolverAgainstBruteForce() {
         Expect(recover::BuildModel(grid, &model, &error), error);
 
         const bool expected = BruteForceExists(model);
-        // 正式求解器与独立暴力枚举必须在“是否存在解”上完全一致。
+        // The production solver and oracle must agree on feasibility.
         recover::Solver solver(model);
         const recover::SolveResult result = solver.Solve();
-        // 这类测试同时覆盖有解和无解，不能只验证能成功构造的答案。
+        // This covers both feasible and infeasible generated instances.
         Expect(result.found == expected,
                "random model disagrees with brute-force result");
+        if (result.found) {
+            // Random differential cases must also survive the independent
+            // validator; a matching Boolean is insufficient if the constructed
+            // directions are malformed or omit a candidate endpoint.
+            std::ostringstream output;
+            recover::PrintDirections(model, result.directions, &output);
+            Expect(ValidateText(model, output.str()).status ==
+                       recover::ValidationStatus::kValid,
+                   "random solver witness must validate");
+        }
         if (failures > 5) {
-            // 连续出现多个不一致时提前停止，避免日志被同一类错误淹没。
+            // Limit repeated failures to keep the output readable.
             return;
         }
     }
 }
 
-// 强制传播专项测试不仅要求有解，
-// 还要求统计中确实发生 queued propagation 和 forced selection。
+// Require both feasibility and evidence that the queue actually forced an edge.
 void TestForcedPropagation() {
-    // 上排度数为 1、2、1，下面一行全为零。
-    // 两条水平候选边必须同时选择；选择第一条后，
-    // 中间连接器只剩一条未知边，传播应自动强制选择第二条。
+    // The top connectors demand 1, 2, 1. Selecting either horizontal edge leaves
+    // the middle connector needing its one remaining candidate.
+    // This fixture is small enough that the queue behavior is easy to inspect
+    // while still requiring two chained forced selections after the first edge.
     recover::Model model = BuildFromText(
         "2 3\n"
         "1 2 1\n"
@@ -464,15 +483,16 @@ void TestForcedPropagation() {
            "propagation queue must process changed endpoints");
     Expect(result.stats.forcedSelections > 0,
            "fixture must trigger forced selection");
+    // The assertion is intentionally statistic-based: a solver that merely
+    // guesses the same answer without using the queue would fail this test.
 }
 
-// 冲突传播测试不只检查最终无解，
-// 还检查统计中确实发生了“选中一条边后自动拒绝交叉边”。
-// 这能防止冲突拒绝逻辑被意外删除，却仍因其他规则碰巧得到无解。
-// 冲突专项测试检查选中边确实触发交叉边拒绝。
+// Check both infeasibility and the conflictRejections counter. The second
+// assertion prevents a removed conflict rule from going unnoticed merely because
+// another constraint still happens to make the fixture impossible.
 void TestConflictPropagation() {
-    // 四个 1 位于十字端点，横竖两条候选长边在中心零位置冲突。
-    // 选中第一条后，传播应立即拒绝另一条，并发现四个端点无法全部满足。
+    // Four one-degree endpoints create perpendicular candidates that cross at
+    // the center zero. Selecting one must reject the other through propagation.
     recover::Model model = BuildFromText(
         "3 3\n"
         "0 1 0\n"
@@ -484,59 +504,53 @@ void TestConflictPropagation() {
     Expect(!result.found, "crossing fixture must be impossible");
     Expect(result.stats.conflictRejections > 0,
            "selected edge must reject its crossing edge");
+    // This is a causal check, not a duplicate of the feasibility assertion.
+    // The crossing edge must be removed by conflict propagation after the first
+    // selection, before the remaining degree equations fail.
 }
 
-// 解析测试覆盖三类输入行为：
-// 1. 合法矩阵应被完整读入；
-// 2. 单个度数越界应在进入建模前失败；
-// 3. 单测试用例后出现额外数据应被拒绝。
-//
-// 这些检查的目的是把输入格式错误和真正的算法无解分开。
-// 如果解析器误接受非法输入，后续模型可能出现越界或错误候选边；
-// 如果解析器误拒绝合法输入，所有搜索测试都无法可靠进行。
+// Exercise valid input, out-of-range degree rejection, and trailing-token
+// rejection. These tests separate malformed input from an infeasible instance.
 void TestParser() {
-    // 正常输入：应成功解析，并保持题目给出的二维规模。
+    // Preserve the stated dimensions for a valid matrix.
     recover::Grid grid;
     std::string error;
     std::istringstream valid("2 3\n1 0 2\n0 3 0\n");
     Expect(recover::ReadSingleCase(&valid, &grid, &error), "valid input");
     Expect(grid.size() == 2 && grid[0].size() == 3, "grid dimensions");
 
-    // 度数为 5 超出单个连接器最多四个方向，必须被解析器拒绝。
+    // Degree 5 exceeds the four incident directions.
     std::istringstream badDegree("2 2\n1 2\n3 5\n");
     Expect(!recover::ReadSingleCase(&badDegree, &grid, &error),
            "degree 5 must be rejected");
 
-    // 题目只有一个测试用例，末尾多出的整数应被拒绝。
+    // A second case or stray integer is not part of the required format.
     std::istringstream extraToken("2 2\n1 0\n0 0\n7\n");
     Expect(!recover::ReadSingleCase(&extraToken, &grid, &error),
            "extra input token must be rejected");
 }
 
-// 候选模型测试不调用求解器，只检查静态构造结果。
-//
-// Sample 3 的关键价值是跨空白位置的长边与交叉冲突；
-// Sample 2 的关键价值是用度数奇偶性在搜索前直接判定不可行。
-// 两项测试分别覆盖“模型必须足够表达问题”和“模型必须尽早排除无解”。
-//
-// 这里同时确认顶点、候选边和冲突对的数量，防止候选边漏建或重复建。
+// Check static construction without invoking Solver. Sample 3 tests long
+// segments and conflict geometry; Sample 2 tests early parity infeasibility.
+// Exact counts catch missing or duplicated candidates and conflicts.
 void TestCandidateModel() {
-    // Sample 3 包含跨空白位置的长边，并有一组交叉冲突。
+    // Sample 3 has a horizontal candidate spanning an empty cell.
     const recover::Model sample3 = BuildFromText(
         "3 5\n"
         "1 1 2 0 1\n"
         "1 0 3 0 2\n"
         "1 2 1 0 1\n");
-    // 11 非零格子产生了 11 个顶点。
-    // 行候选段与列候选段合计 15 条，其中水平跨空白的边把冲突暴露出来。
+    // Eleven connectors and fifteen row/column candidates expose one crossing.
     Expect(sample3.vertexCount == 11, "sample 3 connector count");
-    // 11 个顶点在本样例中产生 15 条行/列候选段。
+    // Verify the total candidate count.
+    // The exact count catches both an omitted maximal run and a duplicate edge
+    // created while scanning the grid.
     Expect(sample3.CandidateEdgeCount() == 15, "sample 3 edge count");
     Expect(sample3.conflictPairCount == 1, "sample 3 conflict count");
-    // 静态检查通过只表示必要条件成立，真正的解仍要由搜索器寻找。
+    // Static feasibility is necessary but does not itself certify a solution.
     Expect(sample3.structurallyPossible, "sample 3 static feasibility");
 
-    // Sample 2 的总度数为奇数，因此候选模型可直接判断不可行。
+    // Sample 2 has odd total demand and fails before search.
     const recover::Model sample2 = BuildFromText(
         "5 6\n"
         "0 0 2 0 0 2\n"
@@ -544,24 +558,18 @@ void TestCandidateModel() {
         "2 2 1 0 0 1\n"
         "0 0 0 0 0 1\n"
         "2 0 2 0 0 2\n");
-    // 25 是奇数；任何栅栏都会让两个端点各增加 1 度，
-    // 所有选边贡献的总度数必然为偶数，因此可以在搜索前停止。
+    // Every fence contributes two degree units, so 25 cannot be partitioned.
     Expect(sample2.totalRequiredDegree == 25,
            "sample 2 total requested degree");
     Expect(!sample2.structurallyPossible,
            "odd total degree must be rejected statically");
 }
 
-// 答案验证测试覆盖一个答案从文本到结构的完整检查过程。
-//
-// Sample 1 验证普通合法输出，Sample 3 验证另一个含长边和多解的输出。
-// 打印往返测试确保 PrintDirections 不会改变坐标或方向顺序。
-// 错误度数测试确认仅有格式正确还不够，必须满足输入规定的度数。
-//
-// 注意：No Solution 在本测试中只验证状态识别，
-// 不把“输出这两个词”误当成已经证明了实例无解。
+// Cover parsing, validation, serialization round trips, and wrong-degree
+// rejection. A No Solution fixture checks recognition of the text marker only;
+// the marker is not treated as proof of global infeasibility.
 void TestOutputValidation() {
-    // 使用题目给出的 Sample 1 输出验证完整合法路径。
+    // Validate the official Sample 1 witness.
     const recover::Model sample1 = BuildFromText(
         "5 6\n"
         "0 0 2 0 0 2\n"
@@ -569,9 +577,10 @@ void TestOutputValidation() {
         "2 2 1 0 0 2\n"
         "0 0 0 0 0 1\n"
         "2 0 2 0 0 2\n");
-    // 下方文本来自题目 Sample 1。
-    // 它有 14 个连接器，每行六个数字：
-    // 行号、列号、上、下、左、右。
+    // Each of the 14 lines stores row, column, up, down, left, and right.
+    // The fixture is copied as an expected source artifact rather than produced
+    // by the solver under test, so a serializer regression cannot silently
+    // change both sides of the comparison.
     const recover::ValidationResult sample1Result = ValidateText(
         sample1,
         "1 3 0 1 0 1\n"
@@ -591,15 +600,15 @@ void TestOutputValidation() {
     Expect(sample1Result.status == recover::ValidationStatus::kValid,
            "sample 1 output must validate");
 
-    // 把验证器解析出的方向重新输出并再次验证，测试打印格式的往返一致。
-    // 这一步能同时覆盖 PrintDirections 的坐标转换和行优先顺序。
+    // Reparse the validator's direction arrays to cover coordinate conversion
+    // and row-major serialization in the opposite direction.
     std::ostringstream roundTrip;
     recover::PrintDirections(sample1, sample1Result.directions, &roundTrip);
     Expect(ValidateText(sample1, roundTrip.str()).status ==
                recover::ValidationStatus::kValid,
            "print/validate round trip");
 
-    // Sample 3 有多个解，这里只验证题目给出的第一个解。
+    // Sample 3 admits multiple answers; validate the published witness.
     const recover::Model sample3 = BuildFromText(
         "3 5\n"
         "1 1 2 0 1\n"
@@ -621,14 +630,11 @@ void TestOutputValidation() {
     Expect(sample3Result.status == recover::ValidationStatus::kValid,
            "sample 3 output must validate");
 
-    // No Solution 只是文本状态，是否真的无解要由求解器证明。
+    // The output validator can recognize this claim but cannot prove it.
     Expect(ValidateText(sample3, "No Solution\n").status ==
                recover::ValidationStatus::kNoSolution,
            "No Solution marker");
-    // 验证器无法从 NO 输出反推全局无解，因此这里只测试状态识别。
-
-    // 将最后一个连接器的度数改错，验证器必须拒绝。
-    // 该连接器原度数为 1，这里把六个数字全部置 0。
+    // Change the degree of the final connector from one to zero.
     std::string wrongDegree =
         "1 1 0 0 0 1\n"
         "1 2 0 0 1 0\n"
@@ -646,15 +652,10 @@ void TestOutputValidation() {
            "wrong degree must fail");
 }
 
-// 交叉测试刻意构造一个“只看端点和度数似乎完全正确”的答案：
-// 四个端点的度数都是 1，两条候选边也都两端匹配。
-// 唯一的错误是两条长边在中心零位置相交。
-//
-// 这个测试防止后续优化时把交叉约束漏掉，或只验证半条栅栏。
+// This witness has correct endpoint pairing and degree at all four connectors.
+// Its only error is that the two long segments cross at an empty center cell.
 void TestIllegalCrossing() {
-    // 四个连接器组成十字形的四个端点，中心位置保持为 0。
-    // 两条候选长边都穿过中心，因此预处理阶段应生成一组冲突。
-    // 若两条长边同时选中，它们会在中心非法交叉。
+    // The four arm endpoints create one conflict through the center zero.
     const recover::Model crossing = BuildFromText(
         "3 3\n"
         "0 1 0\n"
@@ -662,41 +663,42 @@ void TestIllegalCrossing() {
         "0 1 0\n");
     Expect(crossing.conflictPairCount == 1,
            "crossing model must contain one conflict");
+    // The model count also guards the distinction between a geometric crossing
+    // and two independent pairs of endpoints with otherwise identical degrees.
 
-    // 这个布局满足每个端点度数为 1，但违反交叉规则。
+    // Every endpoint has degree one, but both segments are selected together.
     const std::string layout =
         "1 2 0 1 0 0\n"
         "2 1 0 0 0 1\n"
         "2 3 0 0 1 0\n"
         "3 2 1 0 0 0\n";
-    // 布局让上端向下、下端向上，同时让左端向右、右端向左。
-    // 每条候选边两端一致，四个端点度数也都为 1；
-    // 唯一的错误是两条边在中心的零位置交叉。
+    // Reciprocal directions are consistent in both candidates.
     Expect(ValidateText(crossing, layout).status ==
                recover::ValidationStatus::kInvalid,
            "fences crossing at an empty point must fail");
+    // A validator that only sums endpoint flags would incorrectly accept this
+    // layout, so the failure specifically exercises the conflict graph.
 }
 
-// 空设计是容易被遗漏的边界条件。
-// 输入没有非零连接器时，不应输出任何连接器行，
-// 也不应把空输出误报为格式错误或 No Solution。
+// An all-zero input has a valid empty representation, not a malformed answer.
 void TestEmptyLayout() {
-    // 没有任何连接器时，空输出就是合法的空设计。
+    // No connectors means no output lines are required.
     const recover::Model empty = BuildFromText(
         "2 2\n"
         "0 0\n"
         "0 0\n");
     const recover::ValidationResult result = ValidateText(empty, "");
-    // 没有连接器时，四个方向数组长度为零，不需要输出任何行。
-    // 空模型的方向数组也为空，验证器不应要求打印任何连接器行。
+    // The validator must accept this exact empty textual representation.
     Expect(result.status == recover::ValidationStatus::kValid,
            "all-zero grid accepts an empty layout");
+    // This is distinct from the No Solution marker: the input has a valid empty
+    // realization, and no fabricated "No Solution" text is required.
 }
 
 }  // namespace
 
 int main() {
-    // 按输入解析、候选模型、输出验证和边界情况分组运行。
+    // Run independent groups in a deterministic order.
     TestParser();
     TestCandidateModel();
     TestOutputValidation();

@@ -5,184 +5,135 @@
 
 namespace recover {
 
-// 当前求解器的核心思想：
-// 每次选一个尚未满足的连接器，一次性决定它还需要选择哪些未知候选边。
-// 因为目标度数最多为 4，单个连接器的局部组合最多 C(4,2)=6 种。
-// 选定组合后，该连接器的其余候选边必须拒绝，否则最终度数会超过要求。
+// The search chooses an unsatisfied connector and commits its remaining local
+// completion at once. Since a connector has at most four incident candidates,
+// there are at most C(4,2) = 6 subsets to enumerate. Every unknown incident
+// candidate outside the chosen subset is then rejected to prevent excess degree.
 //
-// 当前版本已经加入事件队列传播、冲突拒绝和 MRV；
-// 无传播版本保留在 Git 历史中，作为搜索节点数的对照基线。
-// 完整搜索通过以下方式保证正确：
-// - 每次选择都检查是否与已选边交叉；
-// - 状态变化通过队列传播强制选择和强制拒绝；
-// - 拒绝同一连接器未进入组合的未知边；
-// - 所有局部选择都被穷举，找到首个解立即返回。
+// Event-queue propagation, conflict rejection, and MRV are pruning mechanisms;
+// they do not change the set of legal layouts. Each selected edge is checked
+// against already selected conflicting edges, and state changes propagate both
+// forced selections and forced rejections until a fixed point is reached.
 //
-// 当前状态的不变量：
-// - edgeStates_[e] 非 UNKNOWN 后，只能由 Rollback 恢复；
-// - selectedDegree_[v] 等于所有 SELECTED 关联边的数量；
-// - selectedDegree_[v] 永远不会大于 requiredDegree[v]；
-// - 已处理连接器的所有未知关联边都已经被拒绝；
-// - 任意两条同时 SELECTED 的候选边都没有冲突。
+// Invariants of a search state:
+// - an edge leaves kUnknown only through AssignEdge and returns through Rollback;
+// - selectedDegree_[v] equals the number of selected incident candidates;
+// - selectedDegree_[v] never exceeds requiredDegree[v];
+// - conflictEdges is symmetric, so selected edges are pairwise conflict-free;
+// - unknownDegree_[v] equals the number of unknown incident candidates.
 //
-// 分支完备性的关键：
-// 假设某个未满足连接器最终还需要 r 条边。
-// 算法枚举它当前所有未知关联边中恰好大小为 r 的每个子集。
-// 任何合法完成方案都必须选择其中一个子集，因此不会漏解。
-// 选定一个子集后，其余未知关联边必须拒绝，所以下一次递归只处理更少选择。
+// Completeness follows from local subset coverage. If a connector still needs r
+// edges, every legal completion must select one r-element subset of its unknown
+// incident candidates. The algorithm enumerates all such subsets. Fixing one
+// subset rejects the connector's other candidates, so recursive branches only
+// make additional decisions and cannot lose a legal completion.
 //
-// 对当前回溯的正确性证明可以拆成两部分：
-// 1. 每次局部组合都逐项检查冲突和端点度数，若报告成功则一定是合法解；
-// 2. 一个连接器的任一合法完整方案都必须从它的某个 need 子集开始，
-//    而算法枚举了全部子集，所以失败分支不会漏掉潜在解。
+// The two proof obligations are therefore:
+// 1. any reported success satisfies exact degree and conflict constraints;
+// 2. exhausting every local subset exhausts every legal completion.
+// Propagation and MRV only remove impossible branches or reorder them.
 //
-// 增量传播和 MRV 只能减少访问节点，不能改变这个语义结论。
-// 如果与 Git 历史中的基线结论不同，优先检查剪枝是否过强。
+// The event queue stores connector ids, not edge ids. Duplicate queue entries
+// are intentional: each inspection reads the latest counters, so stale entries
+// become no-ops. With at most four candidates per connector, this remains small.
 //
-// 当前搜索树中每个节点对应：
-// - 已经确定的若干条候选边；
-// - 已被拒绝的若干条候选边；
-// - 尚未到达目标度数的连接器集合。
-// 一次派生的子节点数量不超过 6；
-// 每次失败恢复父节点状态，因此不同兄弟分支互不影响。
+// MRV (minimum remaining values) orders variables by the local combination
+// count C(unknown, needed). Smaller counts are explored first because they are
+// likely to reveal contradictions sooner and trigger conflict propagation
+// earlier. Ties prefer a larger conflict weight, then the lower vertex id.
 //
-// 增量传播版本额外维护以下不变量：
-// - 每条边的状态只从 UNKNOWN 进入 SELECTED 或 REJECTED 一次；
-// - unknownDegree[v] 等于 v 的 UNKNOWN 关联边数；
-// - 状态变化后，两个端点至少各有一次机会重新检查；
-// - 只要 selected <= required 且 selected+unknown >= required，
-//   当前连接器还有完成可能；否则整个分支立即失败；
-// - 选中边引起的冲突拒绝也必须进入队列，
-//   因为它会减少冲突边端点的 unknownDegree。
-//
-// 队列中的元素是“连接器编号”，不是候选边编号。
-// 同一连接器可能重复入队，这是刻意允许的：
-// 每次处理都会读取该顶点最新计数，旧事件自然变成空操作。
-// 这样实现简单，且一个顶点最多四条候选边，重复次数可控。
-//
-// MRV（Minimum Remaining Values）只决定“先处理哪个连接器”：
-// - selected 是已经选中的关联边数；
-// - required 是目标度数；
-// - need = required - selected；
-// - available 是仍为 UNKNOWN 的关联边数；
-// - 局部组合数 = C(available, need)。
-//
-// C(available,need) 越小，说明当前连接器剩下的局部选择越少。
-// 优先处理它，更容易马上发现矛盾，也通常能让冲突拒绝更早传播。
-// MRV 是变量排序启发式，不会跳过任何组合，因此不改变完备性。
-// 两个连接器的组合数相同时，优先选择冲突邻边更多的那个；
-// 最后再用较小的顶点编号打破平局，保证搜索顺序稳定可复现。
+// Each child fixes one connector's complete local contribution before the next
+// recursive call. This keeps depth bounded by the number of connectors rather
+// than by the number of candidates, while TryCombination still enumerates every
+// subset exactly once. The trail contains only changes made below its
+// checkpoint, so rollback does not need to copy the full search state.
 
-// 构造阶段只初始化边状态和每个连接器当前的已选度数。
-// 这里不构建候选边，因为 Model 已经在 BuildModel 中完成静态构造。
+// Initialize edge states and per-connector counters from the static model.
 Solver::Solver(const Model& model)
     : model_(model),
       edgeStates_(model.CandidateEdgeCount(), kUnknown),
       selectedDegree_(model.vertexCount, 0),
       unknownDegree_(model.vertexCount, 0) {
-    // 初始时所有关联候选边都是 UNKNOWN。
+    // Every incident candidate starts unknown.
     for (int v = 0; v < model_.vertexCount; ++v) {
         unknownDegree_[v] =
             static_cast<int>(model_.incidentEdges[v].size());
     }
 }
 
-// Solve 是唯一公开入口。
-// 它先处理静态模型已经确定的无解，再启动深度优先搜索。
-// 搜索一旦成功就不再探索后续兄弟分支，满足题目“任意解”要求。
+// Solve first honors static infeasibility, then starts depth-first search.
+// It stops at the first valid layout because the problem accepts any solution.
 SolveResult Solver::Solve() {
-    // 候选模型的必要条件已经失败时，不需要进入搜索。
+    // A failed necessary condition is already a complete infeasibility proof.
     if (!model_.structurallyPossible) {
         return result_;
     }
 
-    // 空模型没有连接器，Search(0) 会直接认为已经完成。
+    // An all-zero model is complete immediately through Search(0).
     if (Search(0)) {
-        // 搜索只维护边的选择状态；
-        // 找到解后统一转换成每个连接器的四方向数组。
+        // Convert the successful edge-state assignment into direction arrays.
         result_.found = true;
         MaterializeDirections();
     }
-    // 无论成功还是失败都保留统计信息，便于报告比较搜索规模。
+    // Keep statistics for both successful and exhaustive searches.
     return result_;
 }
 
-// AssignEdge 是当前版本唯一的状态修改入口。
-//
-// newState 只允许 REJECTED 或 SELECTED。
-// 如果边已经是同一状态，重复赋值视为成功；
-// 如果边已是相反状态，说明当前分支产生矛盾并返回 false。
-//
-// 变量命名约定：
-// - edgeId 是全局候选边编号；
-// - edge.u、edge.v 是两个连接器顶点编号；
-// - selectedDegree_ 只统计 SELECTED，不统计 UNKNOWN 或 REJECTED。
+// AssignEdge is the sole state-changing entry point.
+// Repeating the current state succeeds; assigning the opposite state after a
+// decision is a branch contradiction. Selecting an edge also rejects every
+// unknown conflicting edge in the same pass, while failing immediately if a
+// conflicting edge was already selected.
 bool Solver::AssignEdge(int edgeId, EdgeState newState) {
-    // 三态一旦确定，在当前分支中不能直接被改写。
+    // A committed edge cannot be overwritten without first rolling back.
     if (edgeStates_[edgeId] != kUnknown) {
         return edgeStates_[edgeId] == newState;
     }
 
-    // 先记录旧状态再修改，Rollback 可以精确撤销这一次赋值。
+    // Record the previous state so rollback can undo exactly this assignment.
     trail_.push_back({edgeId, edgeStates_[edgeId]});
     edgeStates_[edgeId] = newState;
 
     const CandidateEdge& edge = model_.edges[edgeId];
 
-    // 无论选择还是拒绝，这条边都不再属于未知集合。
-    // 两个端点都可能因此触发新的强制规则，所以都加入事件队列。
+    // Both endpoints lose one unknown incident edge and may now have a forced
+    // decision, regardless of whether this edge was selected or rejected.
     --unknownDegree_[edge.u];
     --unknownDegree_[edge.v];
     pendingVertices_.push_back(edge.u);
     pendingVertices_.push_back(edge.v);
 
     if (newState == kSelected) {
-        // 选边会同时增加两个端点的度数，这正是无向栅栏的含义。
+        // An undirected fence contributes one degree unit at each endpoint.
         ++selectedDegree_[edge.u];
         ++selectedDegree_[edge.v];
 
-        // 如果已经存在冲突的选中边，当前分支立即失败。
-        if (HasSelectedConflict(edgeId)) {
-            return false;
-        }
-
-#if !defined(RECOVER_DISABLE_CONFLICT_PROPAGATION)
-        // 正式构建在选中边时立即拒绝所有交叉边。
-        // 基准构建可以关闭这一步，用于量化冲突传播本身的价值。
+        // One scan preserves conflict correctness in every build. The submitted
+        // build additionally rejects unknown conflicting edges immediately; the
+        // comparison build disables that propagation to isolate its value.
         for (int other : model_.conflictEdges[edgeId]) {
+            // Simultaneous selections would cross at an empty cell.
             if (edgeStates_[other] == kSelected) {
                 return false;
             }
+#if !defined(RECOVER_DISABLE_CONFLICT_PROPAGATION)
             if (edgeStates_[other] == kUnknown) {
                 ++result_.stats.conflictRejections;
                 if (!AssignEdge(other, kRejected)) {
                     return false;
                 }
             }
-        }
 #endif
+        }
     }
     return true;
 }
 
-// 检查某条候选边是否与当前已选边冲突。
-// conflictEdges[edgeId] 已经包含所有候选冲突边，
-// 因此这里不需要扫描全部水平/竖直边。
-bool Solver::HasSelectedConflict(int edgeId) const {
-    // conflictEdges 是对称邻接表，只需检查当前边对应的一项。
-    for (int other : model_.conflictEdges[edgeId]) {
-        if (edgeStates_[other] == kSelected) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// 完成条件不是“候选边都处理完”，而是“每个连接器度数准确”。
-// 未选择的候选边可以是 UNKNOWN 或 REJECTED；
-// 只要其两端连接器都已满足度数，答案就已经有效。
+// A state is complete when every connector reaches its exact required degree.
+// Undecided candidates may remain unknown; their endpoints are already
+// satisfied, so they must never be selected later in this branch.
 bool Solver::IsComplete() const {
-    // 只有所有连接器都精确达到输入度数，答案才完成。
+    // Exact degree, not processing all candidate edges, defines completion.
     for (int v = 0; v < model_.vertexCount; ++v) {
         if (selectedDegree_[v] != model_.requiredDegree[v]) {
             return false;
@@ -191,24 +142,16 @@ bool Solver::IsComplete() const {
     return true;
 }
 
-// Propagate 消费事件队列，直到没有新的强制变化。
-//
-// 对每个连接器 v 维护三个量：
-// selected = 已经选中的关联边数；
-// unknown  = 尚未决定的关联边数；
-// required = 输入要求的目标度数。
-//
-// 两类强制规则：
-// 1. selected == required：
-//    已经满足度数，所有 UNKNOWN 边都必须拒绝。
-// 2. selected + unknown == required：
-//    为了达到目标度数，所有 UNKNOWN 边都必须选择。
-//
-// 第二条规则中的一个选择还可能触发冲突拒绝，
-// 冲突拒绝又会让其他连接器的 unknown 减少，因此必须继续处理队列。
+// Propagate consumes connector events until no forced decision remains.
+// For each connector, selected + unknown < required proves branch failure.
+// selected == required forces every unknown incident edge to be rejected.
+// selected + unknown == required forces every unknown incident edge to be
+// selected. Conflict rejection produced by one forced selection queues the
+// affected endpoints again, so the loop continues to a fixed point.
+// The first forced edge can therefore produce a wave of later events through
+// the other selected endpoint, through a conflict rejection, or through both.
 bool Solver::Propagate() {
-    // 使用一个 vector 加 pendingHead_ 作为 FIFO 队列。
-    // 消费过的前缀不立即 erase，避免重复搬移元素。
+    // pendingHead_ implements a FIFO queue without erasing a consumed prefix.
     while (pendingHead_ < pendingVertices_.size()) {
         const int v = pendingVertices_[pendingHead_++];
         ++result_.stats.propagationEvents;
@@ -217,14 +160,13 @@ bool Solver::Propagate() {
         const int selected = selectedDegree_[v];
         const int unknown = unknownDegree_[v];
 
-        // 当前分支已经不可能恰好满足 v 的度数。
+        // Too many selections or too few remaining choices proves failure.
         if (selected > required || selected + unknown < required) {
             return false;
         }
 
         if (selected == required) {
-            // 已经达到目标度数后，任何额外选边都会超度数，
-            // 所以所有仍未决定的关联边都必须拒绝。
+            // Any additional selection would exceed the target degree.
             for (int edgeId : model_.incidentEdges[v]) {
                 if (edgeStates_[edgeId] == kUnknown) {
                     ++result_.stats.forcedRejections;
@@ -234,8 +176,8 @@ bool Solver::Propagate() {
                 }
             }
         } else if (selected + unknown == required) {
-            // 即使当前仍为未知的边全部选上，也只能刚好达到目标。
-            // 因此这些未知边不是“可选项”，而是全部强制选择。
+            // Selecting every remaining unknown edge is the only way to reach
+            // the target, so these edges are forced rather than optional.
             for (int edgeId : model_.incidentEdges[v]) {
                 if (edgeStates_[edgeId] == kUnknown) {
                     ++result_.stats.forcedSelections;
@@ -249,21 +191,21 @@ bool Solver::Propagate() {
     return true;
 }
 
-// ChooseBranch 计算所有未满足连接器的剩余局部空间，并返回 MRV 最优者。
-//
-// 组合数采用经典二项式：
-// C(n,k) = n! / (k! * (n-k)!)
-//
-// 本项目中 n 最多为 4，因此可以直接用整数递推计算，不会溢出。
-// 如果某连接器的 available < need，当前分支已经不可能完成。
-// 用 vertex=-2 表示这个矛盾，调用者无需继续枚举其他连接器。
+// ChooseBranch scans every unsatisfied connector, computes its remaining local
+// combination count, and returns the MRV choice. The iterative binomial
+// recurrence is exact for n <= 4. As soon as any connector has fewer available
+// edges than needed, impossible is set and scanning can stop.
+// The scan is intentionally repeated at each node: counters change after
+// propagation, so reusing an earlier ordering would ignore newly learned
+// constraints. This costs a linear pass over connectors but keeps the branch
+// choice aligned with the current state.
 Solver::BranchChoice Solver::ChooseBranch() {
     BranchChoice best;
     best.combinationCount = std::numeric_limits<int>::max();
 
 #if defined(RECOVER_FIXED_ORDER)
-    // 对照基准固定选择编号最小的未满足连接器。
-    // 此分支只在专门的 benchmark 构建中启用。
+    // The comparison baseline uses the smallest unsatisfied connector id.
+    // This path is compiled only for benchmark builds.
     for (int v = 0; v < model_.vertexCount; ++v) {
         const int need = model_.requiredDegree[v] - selectedDegree_[v];
         if (need == 0) {
@@ -278,7 +220,7 @@ Solver::BranchChoice Solver::ChooseBranch() {
             }
         }
         if (static_cast<int>(best.availableEdges.size()) < need) {
-            best.vertex = -2;
+            best.impossible = true;
         }
         return best;
     }
@@ -287,7 +229,7 @@ Solver::BranchChoice Solver::ChooseBranch() {
     for (int v = 0; v < model_.vertexCount; ++v) {
         const int need = model_.requiredDegree[v] - selectedDegree_[v];
         if (need == 0) {
-            // 已满足的连接器不需要成为分支变量。
+            // A satisfied connector has no remaining decision.
             continue;
         }
 
@@ -297,8 +239,8 @@ Solver::BranchChoice Solver::ChooseBranch() {
             if (edgeStates_[edgeId] == kUnknown) {
                 available.push_back(edgeId);
 
-                // 一条候选边可能与多条垂直/水平边冲突。
-                // 冲突数越多，一旦在本连接器做出选择，越可能传播更多拒绝。
+                // A candidate may conflict with several perpendicular edges.
+                // More conflicts can produce stronger propagation after a choice.
                 conflictWeight +=
                     static_cast<int>(model_.conflictEdges[edgeId].size());
             }
@@ -306,12 +248,12 @@ Solver::BranchChoice Solver::ChooseBranch() {
 
         if (static_cast<int>(available.size()) < need) {
             BranchChoice impossible;
-            impossible.vertex = -2;
+            impossible.impossible = true;
             return impossible;
         }
 
-        // 组合数 C(available.size(), need)。
-        // 边数最多 4，这个乘法结果也只需要很小的整数类型。
+        // Compute C(available.size(), need) with intermediate products that
+        // remain divisible at every step.
         int combinations = 1;
         for (int i = 0; i < need; ++i) {
             combinations =
@@ -325,9 +267,9 @@ Solver::BranchChoice Solver::ChooseBranch() {
             combinations == best.combinationCount;
         const bool moreConflicts =
             conflictWeight > best.conflictWeight;
-        // MRV 第一关键字：剩余局部组合数更少。
-        // 第二关键字：冲突更多，单次分支可能产生更强传播。
-        // 仍在平局时保持较小 vertex 编号，因为循环从小到大。
+        // Primary key: fewer remaining local completion subsets.
+        // Secondary key: larger conflict weight. The ascending scan preserves
+        // the lower vertex id on a complete tie and makes results reproducible.
         if (best.vertex == -1 || fewerValues ||
             (sameValues && moreConflicts)) {
             best.vertex = v;
@@ -341,19 +283,19 @@ Solver::BranchChoice Solver::ChooseBranch() {
 #endif
 }
 
-// Search 返回 true 表示当前状态已经找到一个完整合法答案。
-// Search 返回 false 表示当前状态的所有局部组合都已穷尽且全部失败。
-//
-// depth 只用于统计递归深度，不参与约束判断。
-// 传播完成后，使用 MRV 选择剩余局部组合最少的连接器。
-// MRV 只改变变量顺序，不改变分支取值和递归语义。
+// Search returns true after finding one complete layout and false only after
+// every local completion below the current state has failed.
+// depth affects statistics but not constraints. MRV changes variable order,
+// not the values explored at each variable.
+// A node counts as visited before propagation because even an immediately
+// contradictory state is work produced by its parent's decision.
 bool Solver::Search(int depth) {
     ++result_.stats.nodes;
     result_.stats.maximumDepth =
         std::max(result_.stats.maximumDepth, depth);
 
-    // 每一层搜索先做增量传播。
-    // 传播失败表示当前分支没有合法完成，不必继续枚举局部组合。
+    // Propagate before branching so forced decisions and contradictions are
+    // discovered from the newest counters rather than the construction state.
     if (!Propagate()) {
         ++result_.stats.backtracks;
         return false;
@@ -363,13 +305,11 @@ bool Solver::Search(int depth) {
         return true;
     }
 
-    // 此时传播已经达到不动点，所有计数都是最新值。
-    // MRV 根据这些最新计数选择变量，而不是根据构造模型时的旧度数。
+    // Propagation is now at a fixed point, so MRV sees current counters.
     BranchChoice choice = ChooseBranch();
 
-    // vertex=-2 表示某个连接器连“凑满度数”的边都不够。
-    // vertex=-1 表示没有选出分支变量，但 IsComplete 又为假，属于内部异常。
-    if (choice.vertex == -2 || choice.vertex == -1) {
+    // No completion subset or no remaining variable ends this node.
+    if (choice.impossible || choice.vertex == -1) {
         ++result_.stats.backtracks;
         return false;
     }
@@ -380,8 +320,7 @@ bool Solver::Search(int depth) {
                           &combinations);
 
     for (const std::vector<int>& combination : combinations) {
-        // 第一个成功组合直接结束整个搜索。
-        // 题目接受任意解，无需继续寻找其他组合。
+        // Any valid layout is sufficient, so the first success ends the search.
         if (TryCombination(choice, combination, depth)) {
             return true;
         }
@@ -391,26 +330,24 @@ bool Solver::Search(int depth) {
     return false;
 }
 
-// 尝试一个完整的局部选择 combination。
-//
-// 组合中的边会被 SELECTED；
-// 同一连接器其余仍为 UNKNOWN 的边会被 REJECTED。
-// 这些修改都在 checkpoint 之后，无论成功还是失败都使用同一套撤销规则。
+// Try one local completion. Its edges are selected, and the chosen connector's
+// other unknown incident edges are rejected. All changes occur after checkpoint
+// and are rolled back together if the branch fails.
 bool Solver::TryCombination(const BranchChoice& choice,
                             const std::vector<int>& combination, int depth) {
-    // checkpoint 之前的边状态属于父分支，失败时必须恢复到这个位置。
+    // State at checkpoint belongs to the parent and is restored on failure.
     const std::size_t checkpoint = trail_.size();
 
     for (int edgeId : combination) {
         if (!AssignEdge(edgeId, kSelected)) {
-            // 一旦某条选中边与已经选中的边冲突，整个组合不可用。
+            // A conflicting selected edge invalidates the entire subset.
             Rollback(checkpoint);
             return false;
         }
     }
 
-    // 该连接器的度数已经由 combination 填满，
-    // 因此同一个连接器的其他未知边都必须拒绝。
+    // The chosen connector is now filled, so every other unknown incident
+    // candidate must be rejected.
     for (int edgeId : model_.incidentEdges[choice.vertex]) {
         if (edgeStates_[edgeId] == kUnknown &&
             !AssignEdge(edgeId, kRejected)) {
@@ -420,22 +357,23 @@ bool Solver::TryCombination(const BranchChoice& choice,
     }
 
     if (Search(depth + 1)) {
-        // 成功后不回滚，保留最终答案所需的边状态。
+        // Preserve selected states for MaterializeDirections on success.
         return true;
     }
 
-    // 子搜索失败时撤销本次局部组合，再尝试下一个组合。
+    // Restore the parent state before trying the next completion subset.
     Rollback(checkpoint);
     return false;
 }
 
-// Rollback 撤销 checkpoint 之后的所有边的状态变化。
-//
-// 状态按修改的逆序恢复，因此同一个边即使将来在传播版本中
-// 经历多次变化，也能逐项回到父分支的状态。
-// 对 SELECTED 边还要减回两个端点的度数。
+// Rollback undoes every state transition after checkpoint in reverse order.
+// Selected edges also decrement their endpoint degrees; all decided edges add
+// one back to the unknown counts of both endpoints.
+// The queue is cleared after rollback. Re-enqueuing inherited events would make
+// the parent process a child's stale transitions, whereas the next child will
+// enqueue whatever its own assignments require.
 void Solver::Rollback(std::size_t checkpoint) {
-    // 逆序撤销状态变化，并同步减回已选度数。
+    // Reverse order is required because state changes form a stack.
     while (trail_.size() > checkpoint) {
         const TrailEntry entry = trail_.back();
         trail_.pop_back();
@@ -445,34 +383,31 @@ void Solver::Rollback(std::size_t checkpoint) {
             --selectedDegree_[edge.u];
             --selectedDegree_[edge.v];
         }
-        // 撤销时这条边重新回到 UNKNOWN，两个端点的未知计数都要加一。
+        // The edge returns to unknown, so both endpoint counters increase.
         ++unknownDegree_[edge.u];
         ++unknownDegree_[edge.v];
         edgeStates_[entry.edgeId] = entry.previousState;
     }
 
-    // 父分支不继承当前分支尚未消费的事件。
+    // The parent must not inherit queued events from the failed child.
     pendingVertices_.clear();
     pendingHead_ = 0;
 }
 
-// 生成 availableEdges 中所有大小恰好为 need 的组合。
-//
-// 例子：availableEdges=[2,5,7]，need=2 时生成
-// [2,5]、[2,7]、[5,7] 三个组合。
-// 每个连接器最多四条候选边，所以组合总数不超过 6，
-// 不需要为一般 k/n 编写更复杂的数据结构。
+// Enumerate every need-sized subset of availableEdges. For example,
+// [2,5,7] with need=2 produces [2,5], [2,7], and [5,7]. At most four
+// candidates are available, so a simple recursive enumeration is sufficient.
 void Solver::EnumerateCombinations(
     const std::vector<int>& availableEdges, int need, int start,
     std::vector<int>* current,
     std::vector<std::vector<int>>* combinations) const {
-    // 当当前组合长度达到 need 时保存一份结果。
+    // Store a complete subset.
     if (static_cast<int>(current->size()) == need) {
         combinations->push_back(*current);
         return;
     }
 
-    // 即使把剩余元素全部放进来仍不足 need，就提前停止该递归分支。
+    // Prune when fewer elements remain than the subset still needs.
     const int remaining =
         need - static_cast<int>(current->size());
     const int slots = static_cast<int>(availableEdges.size()) - start;
@@ -482,8 +417,7 @@ void Solver::EnumerateCombinations(
 
     for (int i = start;
          i <= static_cast<int>(availableEdges.size()) - remaining; ++i) {
-        // 选择第 i 条边后，后续递归只能从 i+1 开始，
-        // 避免同一组合因不同顺序被重复枚举。
+        // Advance the start index to generate each unordered subset once.
         current->push_back(availableEdges[i]);
         EnumerateCombinations(availableEdges, need, i + 1, current,
                               combinations);
@@ -491,18 +425,15 @@ void Solver::EnumerateCombinations(
     }
 }
 
-// 搜索完成后的最后一步：把边状态翻译成题目需要的数据。
-//
-// 候选边 e 对应：
-// - directions[e.u][e.directionAtU] = 1；
-// - directions[e.v][e.directionAtV] = 1。
-// REJECTED 和 UNKNOWN 都保持 0。
+// Convert selected candidate edges to the four direction flags per connector.
+// Each selected edge sets one reciprocal bit at each endpoint; rejected and
+// unknown candidates leave their direction slots at zero.
 void Solver::MaterializeDirections() {
-    // 初始时所有连接器的四个方向都是 0。
+    // Start with no incident fences.
     result_.directions.assign(
         model_.vertexCount, std::array<int, 4>{0, 0, 0, 0});
 
-    // 每条 SELECTED 候选边会让两个端点各有一个方向变成 1。
+    // A selected candidate contributes one bit to each endpoint.
     for (int edgeId = 0; edgeId < model_.CandidateEdgeCount(); ++edgeId) {
         if (edgeStates_[edgeId] != kSelected) {
             continue;

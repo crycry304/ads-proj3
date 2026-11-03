@@ -18,7 +18,7 @@ For every row, consecutive non-zero connectors define possible horizontal fence 
 
 This is an exact-degree constraint problem with pairwise crossing conflicts. It is not sufficient to apply a plain bipartite matching reduction because candidate segments may span empty cells and the candidate graph is not guaranteed to be bipartite.
 
-## Planned algorithm
+## Algorithm
 
 The exact solver will use:
 
@@ -34,13 +34,12 @@ The algorithm stops after finding the first valid layout, since the problem acce
 ## Repository status
 
 The exact solver is implemented with event-driven propagation, conflict rejection,
-forced decisions, rollback, and MRV branching. The program is now in the
-correctness-validation and performance-measurement phase. The final report and
-anonymous peer-review package are still to be prepared.
+forced decisions, rollback, and MRV branching. The correctness suite, reproducible
+benchmark corpus, and illustrated anonymous report are complete.
 
-## Planned repository layout
+## Repository layout
 
-The implementation repository will grow to the following structure:
+The repository has the following structure:
 
 ```text
 ads-proj3/
@@ -53,15 +52,18 @@ ads-proj3/
 │   ├── model.cpp
 │   ├── solver.hpp
 │   ├── solver.cpp
-│   └── validator.hpp
+│   ├── validator.hpp
+│   └── validator.cpp
 ├── tests/
-│   ├── sample/
-│   ├── brute_force.cpp
+│   ├── samples/
+│   ├── benchmark_runner.cpp
 │   └── test_runner.cpp
 ├── tools/
-│   ├── generate_tests.py
-│   ├── stress_test.py
-│   └── benchmark.py
+│   ├── check_comments.py
+│   ├── generate_cases.py
+│   ├── make_report_figures.py
+│   ├── prepare_report_data.py
+│   └── run_benchmarks.py
 ├── data/
 │   └── experiments/
 └── reports/
@@ -97,7 +99,9 @@ The three samples cover:
 - an immediate impossible case whose total requested degree is odd;
 - a non-unique case with a crossing conflict.
 
-Implementation testing will additionally include exhaustive small-grid differential tests, randomized feasible and infeasible instances, boundary cases, and maximum-size stress tests.
+Implementation testing includes exhaustive small-grid differential tests,
+randomized feasible and infeasible instances, boundary cases, and maximum-size
+stress tests.
 
 ## Validation status
 
@@ -110,6 +114,8 @@ Implementation testing will additionally include exhaustive small-grid different
   timeout; its maximum observed median is about 0.333 seconds.
 - The problem statement publishes no time limit, so performance is reported as
   an empirical comparison rather than an artificially fixed pass threshold.
+- All submitted C++ comments are English, and no Chinese source text remains.
+- The comment quality gate passes at 33% for `src/` and 30% for all C++ source.
 
 ## Build and usage
 
@@ -140,6 +146,12 @@ Run the internal benchmark executable:
 
 ```powershell
 .\build\Release\recover_benchmark.exe --repeat 5 data\generated\...\*.in
+```
+
+Check the submitted comment language and density before committing:
+
+```powershell
+python tools\check_comments.py
 ```
 
 Prepare report figure data and compile the anonymous report:

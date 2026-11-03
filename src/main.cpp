@@ -9,16 +9,12 @@
 
 namespace {
 
-// 当前命令行同时充当正式程序入口和调试/验证入口。
-// 帮助信息输出到 stderr，保证正式答案的 stdout 不混入提示文字。
-// 调试命令设计：
-// --model-info 只打印候选模型规模，不尝试求解；
-// --validate 读取一个候选答案并单独验证它。
-// 后续求解器使用无参数模式时，标准输出只能包含题目答案。
+// The executable serves both the submitted solver and developer diagnostics.
+// Usage text goes to stderr so standard output contains only the answer.
+// --model-info reports candidate-model statistics without searching.
+// --validate checks a supplied answer against an input instance.
 //
-// 没有参数时目前只打印 usage，不会伪造 No Solution。
-// 这样在求解器尚未接入时，不会让测试误以为某个输入真的无解。
-// 所有调试输出要么写到文件内容，要么使用 stderr。
+// Invalid command shapes print usage and return a non-zero exit code.
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
@@ -30,23 +26,19 @@ void PrintUsage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // 输入最多只有 2500 个整数，普通 cin/cout 已足够快。
+    // The input contains at most 2500 integers, so standard streams suffice.
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    // 无参数时从 stdin 读取并求解；调试模式从文件读取。
-    // 退出码约定：
-    // 0 = 命令成功；
-    // 1 = 候选答案无效；
-    // 2 = 参数、文件或输入格式错误；
-    // 3 = 候选答案文本为 No Solution。
+    // Exit codes: 0 success, 1 invalid answer, 2 usage/input error,
+    // and 3 for a supplied answer that says No Solution.
     if (argc != 1 && argc != 3 && argc != 4) {
         PrintUsage();
         return 2;
     }
 
     if (argc == 1) {
-        // 正式评测路径：从 stdin 读取唯一测试用例。
+        // Submitted mode reads the sole test case from stdin.
         recover::Grid grid;
         std::string error;
         if (!recover::ReadSingleCase(&std::cin, &grid, &error)) {
@@ -62,7 +54,7 @@ int main(int argc, char** argv) {
 
         recover::Solver solver(model);
         const recover::SolveResult result = solver.Solve();
-        // 求解器返回 false 时，当前基线已经完整穷尽搜索树。
+        // The solver returns false only after an exact exhaustive search.
         if (result.found) {
             recover::PrintDirections(model, result.directions, &std::cout);
         } else {
@@ -72,7 +64,7 @@ int main(int argc, char** argv) {
     }
 
     const std::string mode = argv[1];
-    // 调试模式从文件读取；最终标准求解模式仍会从 std::cin 读取。
+    // Diagnostic modes read an explicit input file.
     std::ifstream inputFile(argv[2]);
     if (!inputFile) {
         std::cerr << "Cannot open input file\n";
@@ -81,21 +73,21 @@ int main(int argc, char** argv) {
 
     recover::Grid grid;
     std::string error;
-    // 解析阶段只检查输入形状和数值范围，不判断题目是否有解。
+    // Parsing checks syntax and ranges, not problem feasibility.
     if (!recover::ReadSingleCase(&inputFile, &grid, &error)) {
         std::cerr << error << '\n';
         return 2;
     }
 
     recover::Model model;
-    // 建模阶段建立候选边与冲突表，但暂时不执行搜索。
+    // Model construction creates candidates and conflicts without searching.
     if (!recover::BuildModel(grid, &model, &error)) {
         std::cerr << error << '\n';
         return 2;
     }
 
     if (mode == "--model-info" && argc == 3) {
-        // 打印模型统计量，方便检查候选边和冲突表有没有构造正确。
+        // Print model statistics for construction debugging.
         std::cout << "rows " << model.rows << '\n'
                   << "cols " << model.cols << '\n'
                   << "connectors " << model.vertexCount << '\n'
@@ -107,18 +99,18 @@ int main(int argc, char** argv) {
     }
 
     if (mode == "--validate" && argc == 4) {
-        // 验证模式必须同时提供输入文件和候选输出文件。
+        // Validation requires both the input and a candidate output file.
         std::ifstream outputFile(argv[3]);
         if (!outputFile) {
             std::cerr << "Cannot open output file\n";
             return 2;
         }
-        // 验证器返回三种状态，其中 No Solution 不等于已经证明无解。
+        // No Solution is a text status, not proof of infeasibility.
         const recover::ValidationResult validation =
             recover::ValidateOutput(model, &outputFile);
-        // 调试模式只打印验证摘要；正式求解模式只打印题目答案。
+        // Diagnostic output is separate from the submitted answer path.
         std::cout << validation.message << '\n';
-        // 0 表示布局合法，1 表示格式或内容错误，3 表示输出声称无解。
+        // Preserve the documented diagnostic exit-code semantics.
         if (validation.status == recover::ValidationStatus::kValid) {
             return 0;
         }
