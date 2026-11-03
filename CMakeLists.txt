@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(recover_core
     src/io.cpp
     src/model.cpp
+    src/solver.cpp
     src/validator.cpp
 )
 target_include_directories(recover_core PUBLIC src)

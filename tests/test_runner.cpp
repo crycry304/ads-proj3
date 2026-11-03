@@ -1,8 +1,12 @@
 #include "io.hpp"
 #include "model.hpp"
+#include "solver.hpp"
 #include "validator.hpp"
 
+#include <bitset>
+#include <cstdint>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -48,6 +52,156 @@ recover::ValidationResult ValidateText(const recover::Model& model,
                                        const std::string& text) {
     std::istringstream output(text);
     return recover::ValidateOutput(model, &output);
+}
+
+// 小规模暴力搜索只枚举候选边子集。
+// 它不依赖正式 Solver 的递归结构，因此适合作为独立真值来源。
+bool BruteForceExists(const recover::Model& model) {
+    const int edgeCount = model.CandidateEdgeCount();
+    if (edgeCount > 20) {
+        return false;
+    }
+
+    const std::uint64_t limit = std::uint64_t{1} << edgeCount;
+    const int targetEdges = model.totalRequiredDegree / 2;
+
+    for (std::uint64_t mask = 0; mask < limit; ++mask) {
+        // 只需要枚举恰好选择一半总度数的子集。
+        if (static_cast<int>(std::bitset<64>(mask).count()) != targetEdges) {
+            continue;
+        }
+
+        std::vector<int> degree(model.vertexCount, 0);
+        bool valid = true;
+        for (int edgeId = 0; edgeId < edgeCount && valid; ++edgeId) {
+            if ((mask & (std::uint64_t{1} << edgeId)) == 0) {
+                continue;
+            }
+
+            const recover::CandidateEdge& edge = model.edges[edgeId];
+            ++degree[edge.u];
+            ++degree[edge.v];
+            if (degree[edge.u] > model.requiredDegree[edge.u] ||
+                degree[edge.v] > model.requiredDegree[edge.v]) {
+                valid = false;
+                break;
+            }
+
+            for (int other : model.conflictEdges[edgeId]) {
+                if ((mask & (std::uint64_t{1} << other)) != 0) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+
+        if (!valid) {
+            continue;
+        }
+        for (int v = 0; v < model.vertexCount; ++v) {
+            if (degree[v] != model.requiredDegree[v]) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) {
+            // 暴力枚举只需要判断是否存在，找到第一个就立即返回。
+            return true;
+        }
+    }
+    return false;
+}
+
+void TestSolverAndValidation(const std::vector<std::vector<int>>& grid,
+                             bool expectedFound) {
+    recover::Model model;
+    std::string error;
+    Expect(recover::BuildModel(grid, &model, &error), error);
+
+    recover::Solver solver(model);
+    const recover::SolveResult result = solver.Solve();
+    // 有解/无解结论先与样例预期比较。
+    Expect(result.found == expectedFound, "solver solvability mismatch");
+    if (!result.found) {
+        return;
+    }
+
+    std::ostringstream output;
+    recover::PrintDirections(model, result.directions, &output);
+    Expect(ValidateText(model, output.str()).status ==
+               recover::ValidationStatus::kValid,
+           "solver output must pass independent validation");
+}
+
+void TestSolverSamples() {
+    // Sample 1 是普通可行实例，用于确认搜索能找到完整布局。
+    TestSolverAndValidation(
+        {
+            {0, 0, 2, 0, 0, 2},
+            {1, 3, 3, 1, 0, 0},
+            {2, 2, 1, 0, 0, 2},
+            {0, 0, 0, 0, 0, 1},
+            {2, 0, 2, 0, 0, 2},
+        },
+        true);
+
+    // Sample 2 的总度数为奇数，模型静态检查会直接拒绝。
+    TestSolverAndValidation(
+        {
+            {0, 0, 2, 0, 0, 2},
+            {1, 3, 3, 1, 0, 0},
+            {2, 2, 1, 0, 0, 1},
+            {0, 0, 0, 0, 0, 1},
+            {2, 0, 2, 0, 0, 2},
+        },
+        false);
+
+    // Sample 3 含跨空白的候选段和一个交叉冲突。
+    TestSolverAndValidation(
+        {
+            {1, 1, 2, 0, 1},
+            {1, 0, 3, 0, 2},
+            {1, 2, 1, 0, 1},
+        },
+        true);
+}
+
+void TestSolverAgainstBruteForce() {
+    // 固定随机种子保证失败可以复现。
+    std::mt19937 generator(20261102U);
+    std::uniform_int_distribution<int> rows(2, 3);
+    std::uniform_int_distribution<int> cols(2, 4);
+    std::bernoulli_distribution nonZero(0.45);
+    std::uniform_int_distribution<int> degree(1, 4);
+
+    for (int test = 0; test < 1000; ++test) {
+        const int n = rows(generator);
+        const int m = cols(generator);
+        std::vector<std::vector<int>> grid(n, std::vector<int>(m, 0));
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < m; ++c) {
+                if (nonZero(generator)) {
+                    grid[r][c] = degree(generator);
+                }
+            }
+        }
+
+        recover::Model model;
+        std::string error;
+        Expect(recover::BuildModel(grid, &model, &error), error);
+
+        const bool expected = BruteForceExists(model);
+        // 正式求解器与独立暴力枚举必须在“是否存在解”上完全一致。
+        recover::Solver solver(model);
+        const recover::SolveResult result = solver.Solve();
+        // 这类测试同时覆盖有解和无解，不能只验证能成功构造的答案。
+        Expect(result.found == expected,
+               "random model disagrees with brute-force result");
+        if (failures > 5) {
+            // 连续出现多个不一致时提前停止，避免日志被同一类错误淹没。
+            return;
+        }
+    }
 }
 
 // 解析测试覆盖三类输入行为：
@@ -266,6 +420,8 @@ int main() {
     TestOutputValidation();
     TestIllegalCrossing();
     TestEmptyLayout();
+    TestSolverSamples();
+    TestSolverAgainstBruteForce();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

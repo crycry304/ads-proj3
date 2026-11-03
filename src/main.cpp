@@ -1,5 +1,6 @@
 #include "io.hpp"
 #include "model.hpp"
+#include "solver.hpp"
 #include "validator.hpp"
 
 #include <fstream>
@@ -21,6 +22,7 @@ namespace {
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
+        << "  recover < input\n"
         << "  recover --validate <input> <output>\n"
         << "  recover --model-info <input>\n";
 }
@@ -32,15 +34,41 @@ int main(int argc, char** argv) {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    // 目前只开放模型统计和答案验证；求解器接入后会增加默认模式。
+    // 无参数时从 stdin 读取并求解；调试模式从文件读取。
     // 退出码约定：
     // 0 = 命令成功；
     // 1 = 候选答案无效；
     // 2 = 参数、文件或输入格式错误；
     // 3 = 候选答案文本为 No Solution。
-    if (argc != 3 && argc != 4) {
+    if (argc != 1 && argc != 3 && argc != 4) {
         PrintUsage();
         return 2;
+    }
+
+    if (argc == 1) {
+        // 正式评测路径：从 stdin 读取唯一测试用例。
+        recover::Grid grid;
+        std::string error;
+        if (!recover::ReadSingleCase(&std::cin, &grid, &error)) {
+            std::cerr << error << '\n';
+            return 2;
+        }
+
+        recover::Model model;
+        if (!recover::BuildModel(grid, &model, &error)) {
+            std::cerr << error << '\n';
+            return 2;
+        }
+
+        recover::Solver solver(model);
+        const recover::SolveResult result = solver.Solve();
+        // 求解器返回 false 时，当前基线已经完整穷尽搜索树。
+        if (result.found) {
+            recover::PrintDirections(model, result.directions, &std::cout);
+        } else {
+            recover::PrintNoSolution(&std::cout);
+        }
+        return 0;
     }
 
     const std::string mode = argv[1];
@@ -88,6 +116,7 @@ int main(int argc, char** argv) {
         // 验证器返回三种状态，其中 No Solution 不等于已经证明无解。
         const recover::ValidationResult validation =
             recover::ValidateOutput(model, &outputFile);
+        // 调试模式只打印验证摘要；正式求解模式只打印题目答案。
         std::cout << validation.message << '\n';
         // 0 表示布局合法，1 表示格式或内容错误，3 表示输出声称无解。
         if (validation.status == recover::ValidationStatus::kValid) {
