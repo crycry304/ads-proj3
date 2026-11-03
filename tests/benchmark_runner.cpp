@@ -121,6 +121,9 @@ void PrintRow(const std::string& path, const recover::Model& model,
 #endif
 
     // 文件 stem 不含目录和扩展名，因此 CSV 中不会暴露绝对路径。
+    // 模型规模列帮助解释不同类别之间的耗时和节点差异。
+    // 搜索统计列区分传播、冲突拒绝和最终 DFS 结构。
+    // wall_ms 是单次重复的原始值，聚合脚本负责计算中位数和最大值。
     std::cout << std::filesystem::path(path).stem().string() << ','
               << model.rows << ',' << model.cols << ','
               << model.vertexCount << ',' << model.CandidateEdgeCount() << ','
@@ -176,6 +179,7 @@ int main(int argc, char** argv) {
         recover::SearchStats warmStats;
         bool warmFound = false;
         double warmMs = 0.0;
+        // 预热不验证答案，只为后续计时减少首次分配和缓存影响。
         const std::string warmError =
             RunOnce(path, false, &warmStats, &warmFound, &warmMs);
         if (!warmError.empty()) {
@@ -189,6 +193,7 @@ int main(int argc, char** argv) {
             recover::SearchStats stats;
             bool found = false;
             double wallMs = 0.0;
+            // 正式运行启用独立答案验证，保证基准不会收录错误解。
             const std::string error =
                 RunOnce(path, true, &stats, &found, &wallMs);
             if (!error.empty()) {
