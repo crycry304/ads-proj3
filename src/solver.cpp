@@ -1,17 +1,20 @@
 #include "solver.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace recover {
 
-// 第一版求解器的核心思想：
+// 当前求解器的核心思想：
 // 每次选一个尚未满足的连接器，一次性决定它还需要选择哪些未知候选边。
 // 因为目标度数最多为 4，单个连接器的局部组合最多 C(4,2)=6 种。
 // 选定组合后，该连接器的其余候选边必须拒绝，否则最终度数会超过要求。
 //
-// 这个版本暂不做事件队列传播，也不根据冲突提前拒绝整批边。
-// 它仍然通过以下方式保证正确：
+// 当前版本已经加入事件队列传播、冲突拒绝和 MRV；
+// 无传播版本保留在 Git 历史中，作为搜索节点数的对照基线。
+// 完整搜索通过以下方式保证正确：
 // - 每次选择都检查是否与已选边交叉；
+// - 状态变化通过队列传播强制选择和强制拒绝；
 // - 拒绝同一连接器未进入组合的未知边；
 // - 所有局部选择都被穷举，找到首个解立即返回。
 //
@@ -28,19 +31,13 @@ namespace recover {
 // 任何合法完成方案都必须选择其中一个子集，因此不会漏解。
 // 选定一个子集后，其余未知关联边必须拒绝，所以下一次递归只处理更少选择。
 //
-// 这一版为什么不直接剪掉全部冲突边：
-// 冲突的提前拒绝属于传播优化，会把多个状态修改连在一起。
-// 基线先保持每次只处理当前连接器的局部选择，
-// 便于用规模很小的暴力枚举验证搜索逻辑本身没有错。
-//
 // 对当前回溯的正确性证明可以拆成两部分：
 // 1. 每次局部组合都逐项检查冲突和端点度数，若报告成功则一定是合法解；
 // 2. 一个连接器的任一合法完整方案都必须从它的某个 need 子集开始，
 //    而算法枚举了全部子集，所以失败分支不会漏掉潜在解。
 //
-// 这个基线暂时可能很慢，但它是后续所有优化的参照物。
 // 增量传播和 MRV 只能减少访问节点，不能改变这个语义结论。
-// 如果优化版本与基线结论不同，优先检查优化版本的剪枝是否过强。
+// 如果与 Git 历史中的基线结论不同，优先检查剪枝是否过强。
 //
 // 当前搜索树中每个节点对应：
 // - 已经确定的若干条候选边；
@@ -62,6 +59,19 @@ namespace recover {
 // 同一连接器可能重复入队，这是刻意允许的：
 // 每次处理都会读取该顶点最新计数，旧事件自然变成空操作。
 // 这样实现简单，且一个顶点最多四条候选边，重复次数可控。
+//
+// MRV（Minimum Remaining Values）只决定“先处理哪个连接器”：
+// - selected 是已经选中的关联边数；
+// - required 是目标度数；
+// - need = required - selected；
+// - available 是仍为 UNKNOWN 的关联边数；
+// - 局部组合数 = C(available, need)。
+//
+// C(available,need) 越小，说明当前连接器剩下的局部选择越少。
+// 优先处理它，更容易马上发现矛盾，也通常能让冲突拒绝更早传播。
+// MRV 是变量排序启发式，不会跳过任何组合，因此不改变完备性。
+// 两个连接器的组合数相同时，优先选择冲突邻边更多的那个；
+// 最后再用较小的顶点编号打破平局，保证搜索顺序稳定可复现。
 
 // 构造阶段只初始化边状态和每个连接器当前的已选度数。
 // 这里不构建候选边，因为 Model 已经在 BuildModel 中完成静态构造。
@@ -237,12 +247,81 @@ bool Solver::Propagate() {
     return true;
 }
 
+// ChooseBranch 计算所有未满足连接器的剩余局部空间，并返回 MRV 最优者。
+//
+// 组合数采用经典二项式：
+// C(n,k) = n! / (k! * (n-k)!)
+//
+// 本项目中 n 最多为 4，因此可以直接用整数递推计算，不会溢出。
+// 如果某连接器的 available < need，当前分支已经不可能完成。
+// 用 vertex=-2 表示这个矛盾，调用者无需继续枚举其他连接器。
+Solver::BranchChoice Solver::ChooseBranch() {
+    BranchChoice best;
+    best.combinationCount = std::numeric_limits<int>::max();
+
+    for (int v = 0; v < model_.vertexCount; ++v) {
+        const int need = model_.requiredDegree[v] - selectedDegree_[v];
+        if (need == 0) {
+            // 已满足的连接器不需要成为分支变量。
+            continue;
+        }
+
+        std::vector<int> available;
+        int conflictWeight = 0;
+        for (int edgeId : model_.incidentEdges[v]) {
+            if (edgeStates_[edgeId] == kUnknown) {
+                available.push_back(edgeId);
+
+                // 一条候选边可能与多条垂直/水平边冲突。
+                // 冲突数越多，一旦在本连接器做出选择，越可能传播更多拒绝。
+                conflictWeight +=
+                    static_cast<int>(model_.conflictEdges[edgeId].size());
+            }
+        }
+
+        if (static_cast<int>(available.size()) < need) {
+            BranchChoice impossible;
+            impossible.vertex = -2;
+            return impossible;
+        }
+
+        // 组合数 C(available.size(), need)。
+        // 边数最多 4，这个乘法结果也只需要很小的整数类型。
+        int combinations = 1;
+        for (int i = 0; i < need; ++i) {
+            combinations =
+                combinations * (static_cast<int>(available.size()) - i) /
+                (i + 1);
+        }
+
+        const bool fewerValues =
+            combinations < best.combinationCount;
+        const bool sameValues =
+            combinations == best.combinationCount;
+        const bool moreConflicts =
+            conflictWeight > best.conflictWeight;
+
+        // MRV 第一关键字：剩余局部组合数更少。
+        // 第二关键字：冲突更多，单次分支可能产生更强传播。
+        // 仍在平局时保持较小 vertex 编号，因为循环从小到大。
+        if (best.vertex == -1 || fewerValues ||
+            (sameValues && moreConflicts)) {
+            best.vertex = v;
+            best.need = need;
+            best.availableEdges = std::move(available);
+            best.combinationCount = combinations;
+            best.conflictWeight = conflictWeight;
+        }
+    }
+    return best;
+}
+
 // Search 返回 true 表示当前状态已经找到一个完整合法答案。
 // Search 返回 false 表示当前状态的所有局部组合都已穷尽且全部失败。
 //
 // depth 只用于统计递归深度，不参与约束判断。
-// 当前选择顺序固定为最小未满足顶点编号，
-// 后续 MRV 版本会替换这一选择策略，但会保留相同的递归语义。
+// 传播完成后，使用 MRV 选择剩余局部组合最少的连接器。
+// MRV 只改变变量顺序，不改变分支取值和递归语义。
 bool Solver::Search(int depth) {
     ++result_.stats.nodes;
     result_.stats.maximumDepth =
@@ -259,29 +338,13 @@ bool Solver::Search(int depth) {
         return true;
     }
 
-    // 基线版本固定选择编号最小的未满足连接器。
-    // 这是确定性顺序，便于后续 MRV 版本做搜索节点对比。
-    BranchChoice choice;
-    for (int v = 0; v < model_.vertexCount; ++v) {
-        if (selectedDegree_[v] >= model_.requiredDegree[v]) {
-            continue;
-        }
+    // 此时传播已经达到不动点，所有计数都是最新值。
+    // MRV 根据这些最新计数选择变量，而不是根据构造模型时的旧度数。
+    BranchChoice choice = ChooseBranch();
 
-        choice.vertex = v;
-        // need 表示这个连接器还差多少条边，而不是最终总度数。
-        // 例如 requiredDegree=3、已选 1 条边时，need=2。
-        choice.need = model_.requiredDegree[v] - selectedDegree_[v];
-        for (int edgeId : model_.incidentEdges[v]) {
-            if (edgeStates_[edgeId] == kUnknown) {
-                choice.availableEdges.push_back(edgeId);
-            }
-        }
-        break;
-    }
-
-    // 找不到未满足连接器但 IsComplete 为假，说明内部状态异常。
-    if (choice.vertex == -1 ||
-        static_cast<int>(choice.availableEdges.size()) < choice.need) {
+    // vertex=-2 表示某个连接器连“凑满度数”的边都不够。
+    // vertex=-1 表示没有选出分支变量，但 IsComplete 又为假，属于内部异常。
+    if (choice.vertex == -2 || choice.vertex == -1) {
         ++result_.stats.backtracks;
         return false;
     }

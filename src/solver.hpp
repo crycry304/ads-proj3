@@ -49,8 +49,8 @@ struct SolveResult {
     SearchStats stats;
 };
 
-// 第一版求解器采用完备回溯，不加入增量约束传播。
-// 它会在后续作为基线与更快的传播版本比较。
+// 当前求解器采用完备回溯、事件队列传播和 MRV 变量排序。
+// Git 历史中的无传播版本用于比较搜索节点数。
 //
 // Solver 对象的生命周期只覆盖一次 Solve 调用。
 // 当前不设计“复用上一次部分状态”的接口，
@@ -82,7 +82,7 @@ private:
         // edgeId 是被修改的候选边。
         int edgeId = -1;
 
-        // previousState 在回溯时恢复；基线版本中一定是 UNKNOWN。
+        // previousState 在回溯时恢复；当前每条边只会从 UNKNOWN 进入确定状态。
         EdgeState previousState = kUnknown;
     };
 
@@ -96,11 +96,21 @@ private:
 
         // availableEdges 只包含当前仍为 UNKNOWN 的关联候选边。
         std::vector<int> availableEdges;
+
+        // 当前连接器在现有状态下有多少个局部组合。
+        // 形式为 C(availableEdges.size(), need)；
+        // 该值越小，MRV 越优先选择这个连接器。
+        int combinationCount = 0;
+
+        // 所有未知关联边的冲突次数之和。
+        // 只在 combinationCount 相同时作为第二关键字。
+        int conflictWeight = 0;
     };
 
     bool AssignEdge(int edgeId, EdgeState newState);
     bool HasSelectedConflict(int edgeId) const;
     bool Propagate();
+    BranchChoice ChooseBranch();
     bool Search(int depth);
     bool IsComplete() const;
     bool TryCombination(const BranchChoice& choice,
