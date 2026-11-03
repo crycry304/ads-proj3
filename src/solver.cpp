@@ -146,8 +146,9 @@ bool Solver::AssignEdge(int edgeId, EdgeState newState) {
             return false;
         }
 
-        // 一旦选中某条边，与它在空白格交叉的所有边都不可能再出现。
-        // 这里直接把它们设为 REJECTED，而不是等未来尝试时才发现矛盾。
+#if !defined(RECOVER_DISABLE_CONFLICT_PROPAGATION)
+        // 正式构建在选中边时立即拒绝所有交叉边。
+        // 基准构建可以关闭这一步，用于量化冲突传播本身的价值。
         for (int other : model_.conflictEdges[edgeId]) {
             if (edgeStates_[other] == kSelected) {
                 return false;
@@ -159,6 +160,7 @@ bool Solver::AssignEdge(int edgeId, EdgeState newState) {
                 }
             }
         }
+#endif
     }
     return true;
 }
@@ -259,6 +261,29 @@ Solver::BranchChoice Solver::ChooseBranch() {
     BranchChoice best;
     best.combinationCount = std::numeric_limits<int>::max();
 
+#if defined(RECOVER_FIXED_ORDER)
+    // 对照基准固定选择编号最小的未满足连接器。
+    // 此分支只在专门的 benchmark 构建中启用。
+    for (int v = 0; v < model_.vertexCount; ++v) {
+        const int need = model_.requiredDegree[v] - selectedDegree_[v];
+        if (need == 0) {
+            continue;
+        }
+
+        best.vertex = v;
+        best.need = need;
+        for (int edgeId : model_.incidentEdges[v]) {
+            if (edgeStates_[edgeId] == kUnknown) {
+                best.availableEdges.push_back(edgeId);
+            }
+        }
+        if (static_cast<int>(best.availableEdges.size()) < need) {
+            best.vertex = -2;
+        }
+        return best;
+    }
+    return best;
+#else
     for (int v = 0; v < model_.vertexCount; ++v) {
         const int need = model_.requiredDegree[v] - selectedDegree_[v];
         if (need == 0) {
@@ -300,7 +325,6 @@ Solver::BranchChoice Solver::ChooseBranch() {
             combinations == best.combinationCount;
         const bool moreConflicts =
             conflictWeight > best.conflictWeight;
-
         // MRV 第一关键字：剩余局部组合数更少。
         // 第二关键字：冲突更多，单次分支可能产生更强传播。
         // 仍在平局时保持较小 vertex 编号，因为循环从小到大。
@@ -314,6 +338,7 @@ Solver::BranchChoice Solver::ChooseBranch() {
         }
     }
     return best;
+#endif
 }
 
 // Search 返回 true 表示当前状态已经找到一个完整合法答案。

@@ -1,0 +1,11 @@
+category,cases,max_median_ms,max_search_nodes,found_count
+conflict_heavy,1,6.825800,205,1
+dense_all_positive,1,332.151000,2402,1
+fragmented,3,0.215500,8,3
+infeasible_boundary,1,0.000900,0,0
+infeasible_odd,3,0.359600,0,0
+planted_feasible,3,12.322400,1404,3
+random_dense,3,0.498000,0,0
+random_sparse_p10,3,0.105500,0,0
+random_sparse_p25,3,0.246400,0,0
+random_sparse_p50,3,0.394600,0,0

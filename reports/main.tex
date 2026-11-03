@@ -1,0 +1,389 @@
+% !TeX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.35cm,headheight=15pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,array}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue,
+  pdftitle={Recover the Design},
+  pdfsubject={Exact search with degree propagation and MRV for Project 3},
+  pdfauthor={}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Recover the Design}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.2em}
+\renewcommand{\arraystretch}{1.15}
+\setlist{itemsep=0.15em,topsep=0.3em}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=lines,
+  numbers=left,
+  numberstyle=\tiny
+}
+
+\title{\vspace{-1.3cm}Recover the Design}
+\author{}
+\date{2026-11-03}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project reconstructs an unknown fence layout from connector degrees.
+Fences may span empty positions, while horizontal and vertical fences may
+cross only at a connector. We model every possible straight fence between
+consecutive non-zero connectors and solve a degree-constrained selection
+problem with pairwise crossing conflicts. The exact solver combines static
+checks, event-driven degree propagation, immediate conflict rejection, a
+rollback trail, and minimum-remaining-values (MRV) branching. Correctness is
+checked against exhaustive small grids and an independent validator.
+Across a deterministic 24-case benchmark corpus, all cases completed within
+the 30-second safety timeout. The maximum observed median runtime was
+331.9 ms. Conflict propagation reduced search from 39,888 to 162 nodes on the
+largest planted case, while MRV was beneficial on medium conflict-heavy inputs
+but not uniformly faster.
+\end{abstract}
+
+\noindent\textbf{Keywords:} recovering a layout; degree constraints; event-driven
+propagation; MRV; conflict graph; exact search
+
+\clearpage
+\tableofcontents
+\clearpage
+
+\section{Introduction}
+
+\subsection{Problem and objectives}
+
+The input is an $n\times m$ grid. A positive value $k\in\{1,2,3,4\}$ denotes a
+connector that must be incident to exactly $k$ fence segments. A zero means
+that no connector exists. Each fence is a straight horizontal or vertical
+segment. A fence may pass through empty positions, but horizontal and vertical
+fences may cross only when the crossing position contains a connector.
+
+The program must output the binary \texttt{up/down/left/right} states of every
+connector in row-major order, or print \texttt{No Solution}. Solutions are not
+unique, so any valid layout is accepted. The objective is to find a valid layout
+or prove that none exists.
+
+\subsection{Why the geometry requires a conflict model}
+
+A common but incorrect simplification is to connect only adjacent non-zero
+cells. Sample 3 disproves it: the connector in row 1, column 3 connects to the
+connector in row 1, column 5 across an empty column. Therefore every possible
+fence is a maximal straight segment between two consecutive non-zero connectors
+in one row or one column.
+
+Two such segments can cross inside an empty cell. If both were selected, they
+would form a crossing without a connector, which the statement forbids.
+
+\section{Data Structure and Algorithm Specification}
+
+\subsection{Candidate graph}
+
+Let $V$ be the set of non-zero connectors and $E$ the set of candidate fence
+segments. In each row, sorted non-zero columns define horizontal segments
+between consecutive connectors. In each column, sorted non-zero rows define
+vertical segments analogously. For a connector $v$, let $E_v\subseteq E$ be
+the set of incident candidates; $|E_v|\le 4$.
+
+For each possible horizontal/vertical pair $(e,f)$, a conflict exists when the
+two segments intersect strictly inside an empty cell. The conflict relation is
+stored as a symmetric adjacency list. Because candidate intervals in one row
+or column do not overlap, each empty cell contains at most one horizontal and
+one vertical candidate, hence at most one conflict pair.
+
+\subsection{Exact constraints}
+
+Let $x_e\in\{0,1\}$ indicate whether candidate $e$ is selected. A valid layout
+satisfies
+\begin{align}
+  \sum_{e\in E_v} x_e &= d_v && \text{for every }v\in V,\\
+  x_e+x_f &\le 1 && \text{for every conflict pair }(e,f).
+\end{align}
+Every selected segment contributes one degree to each endpoint. Thus the total
+number of selected segments is exactly $\frac{1}{2}\sum_v d_v$.
+
+\subsection{Static checks}
+
+The model is rejected before search when:
+\begin{itemize}
+  \item the total requested degree is odd;
+  \item a connector has fewer incident candidates than its required degree;
+  \item a candidate-graph component has odd degree demand or too few edges.
+\end{itemize}
+These checks are necessary conditions only. Passing them does not imply that a
+solution exists.
+
+\subsection{Event-driven propagation}
+
+The solver stores an edge state in $\{\mathrm{UNKNOWN},\mathrm{SELECTED},
+\mathrm{REJECTED}\}$. For each connector it maintains the number of selected
+incident edges and the number of unknown incident edges. When an edge changes
+state, both endpoint connectors enter an event queue.
+
+For a queued connector $v$, let $s_v$ be its selected degree, $u_v$ its unknown
+degree, and $d_v$ its required degree. The branch fails immediately if
+$s_v>d_v$ or $s_v+u_v<d_v$. Otherwise:
+\begin{itemize}
+  \item if $s_v=d_v$, every unknown incident edge is rejected;
+  \item if $s_v+u_v=d_v$, every unknown incident edge is selected.
+\end{itemize}
+Selecting an edge immediately rejects all crossing candidates. Those changes
+enqueue their endpoints, so the propagation continues until a fixed point is
+reached or a contradiction is found.
+
+\begin{lstlisting}[caption={Incremental propagation at one connector}]
+while queue is not empty:
+    v = pop_vertex(queue)
+    if selected[v] > required[v]: reject_branch()
+    if selected[v] + unknown[v] < required[v]: reject_branch()
+
+    if selected[v] == required[v]:
+        reject_all_unknown_edges_incident_to(v)
+    else if selected[v] + unknown[v] == required[v]:
+        select_all_unknown_edges_incident_to(v)
+\end{lstlisting}
+
+\subsection{MRV branching}
+
+After propagation reaches a fixed point, every unsatisfied connector has
+\begin{equation}
+  \mathit{need}_v = d_v-s_v,\qquad
+  B_v=\binom{u_v}{\mathit{need}_v}.
+\end{equation}
+$B_v$ is the number of immediate local assignments for connector $v$. MRV
+chooses the connector with the smallest $B_v$; since $u_v\le4$, $B_v\le6$.
+Ties prefer more incident crossing conflicts and then the smaller internal
+vertex id. MRV changes only the order of complete value enumeration and
+therefore preserves completeness.
+
+\subsection{Search and rollback}
+
+At each search level, propagation is completed first. If every connector has
+exactly its required degree, the first solution is returned. Otherwise MRV
+selects a connector and enumerates every combination of exactly
+$\mathit{need}_v$ unknown incident edges. The chosen edges are selected and the
+other incident unknown edges are rejected. Every state change records its edge
+id and previous state in a trail.
+
+If a branch fails, the trail is rolled back to the branch checkpoint, restoring
+edge states and both degree counters. The next combination is then tried. The
+search is complete because every legal completion must choose one of the
+enumerated local subsets.
+
+\section{Testing Results}
+
+\subsection{Environment and method}
+
+\begin{table}[H]
+\centering
+\caption{Experimental environment}
+\begin{tabular}{ll}
+\toprule
+Item & Configuration \\
+\midrule
+Platform & Windows, Intel CPU \\
+Compiler & MSVC 19.51 \\
+Build system & CMake, Visual Studio 18 2026 generator \\
+Configurations & Debug and Release \\
+Correctness & CTest plus independent output validator \\
+Benchmark repetitions & one warm-up, then five measured runs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Correctness cases}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{5.2cm}rr>{\raggedright\arraybackslash}p{5.7cm}}
+\caption{Correctness test summary}\\
+\toprule
+Test group & Cases & Status & Purpose \\
+\midrule
+\endfirsthead
+\toprule
+Test group & Cases & Status & Purpose \\
+\midrule
+\endhead
+Official samples & 3 & pass & Feasible, impossible, multi-solution \\
+Exhaustive $2\times2$ & 625 & pass & Every degree matrix \\
+Exhaustive $2\times3$ & 15,625 & pass & Complete small-input differential test \\
+Random $2\times2$ to $3\times4$ & 1,000 & pass & Brute-force differential test \\
+Random $3\times3$ and $3\times4$ & 3,000 & pass & Larger differential test \\
+Planted feasible layouts & 200 & pass & No false \texttt{No Solution} \\
+Required edge cases & 9 & pass & Straight, T, cross, boundary, disconnected \\
+Forced propagation & 1 & pass & Queue and forced selection executed \\
+Conflict propagation & 1 & pass & Crossing rejection executed \\
+\bottomrule
+\end{longtable}
+
+Every constructed answer is passed back through the independent validator.
+Debug and Release CTest both pass. Invalid degree, malformed output, one-sided
+fences, and empty-cell crossings are rejected by dedicated tests.
+
+\clearpage
+\subsection{Benchmark corpus}
+
+\begin{table}[H]
+\centering
+\caption{Current solver results by category}
+\begin{tabular}{lrrr}
+\toprule
+Category & Cases & Max median (ms) & Max nodes \\
+\midrule
+Conflict-heavy 50x50 & 1 & 6.826 & 205 \\
+Dense all-positive 50x50 & 1 & 332.151 & 2,402 \\
+Fragmented 10/25/50 & 3 & 0.216 & 8 \\
+Infeasible boundary & 1 & 0.001 & 0 \\
+Infeasible odd degree & 3 & 0.360 & 0 \\
+Planted feasible 10/25/50 & 3 & 12.322 & 1,404 \\
+Random dense 10/25/50 & 3 & 0.498 & 0 \\
+Random sparse p=0.10 & 3 & 0.106 & 0 \\
+Random sparse p=0.25 & 3 & 0.246 & 0 \\
+Random sparse p=0.50 & 3 & 0.395 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All 24 cases completed. The maximum measured run was 349.880 ms, well below
+the 30-second safety timeout. All search statistics were identical across five
+repetitions.
+
+\section{Analysis and Comments}
+
+\subsection{Complexity}
+
+Let $P$ be the number of connectors and $M$ the number of candidate fence
+segments. Here $P\le 2500$ and $M<5000$. Building the connectors and candidate
+edges takes $O(nm+P)$. Scanning the empty cells for conflicts takes
+$O(nm+M)$, and the conflict graph contains at most $O(nm)$ pairs.
+
+One propagation event processes at most four incident edges, but rejected
+conflict edges may enqueue their own endpoints. If $W$ changes occur on one
+search path, propagation costs $O(W)$ in that branch. Selecting the MRV variable
+scans $P$ connectors and inspects four incident edges each, so one selection
+costs $O(P)$.
+
+If $N$ is the number of visited search nodes and $L$ is the cost of one node,
+the search takes $O(NL)$. Branching remains exponential in the worst case.
+It is therefore necessary to report measured node counts rather than only the
+theoretical upper bound.
+
+\subsection{Version comparison}
+
+\begin{table}[H]
+\centering
+\caption{Search-node comparison on representative cases}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Case & Degree only & Degree+conflict & MRV & MRV change \\
+\midrule
+Planted 10x10 & 21 & 14 & 7 & -50.0\% \\
+Planted 25x25 & 176,118 & 6,636 & 137 & -97.9\% \\
+Planted 50x50 & 39,888 & 162 & 1,404 & +766.7\% \\
+Conflict-heavy 50x50 & 271 & 265 & 205 & -22.6\% \\
+Dense all-positive 50x50 & 2,402 & 2,402 & 2,402 & 0.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The no-propagation baseline completed 20 of 24 cases within a five-second
+comparison limit; four large cases timed out. Degree-only propagation completed
+all cases, while adding conflict propagation sharply reduced nodes on planted
+inputs. MRV improved the medium planted and conflict-heavy cases but selected
+an unlucky branch on the largest planted case.
+
+\subsection{Comments and limitations}
+
+MRV is a heuristic, not a guarantee of a smaller global subtree. The dense
+all-positive graph has the same node count under fixed order and MRV, but MRV
+incurs a full connector scan at every node. This overhead is visible in the
+roughly 332 ms median against about 3 ms for fixed order.
+
+The official problem statement gives no time limit. Results therefore describe
+this machine, compiler, seed, and input corpus. A separate 50x50 planted probe
+with density 0.50--0.55 exceeded a 15--30 second limit and is excluded from the
+fixed acceptance corpus. This identifies dense random degree-constrained
+instances as a limitation rather than claiming universal efficiency.
+
+\subsection{Further improvements}
+
+Future work can maintain the unresolved-connector set to avoid scanning all
+connectors for MRV, add stronger forward checking after each local combination,
+and use component decomposition when conflict edges do not couple candidate
+components. A certified maximum bipartite subgraph solver could also provide
+cheaper infeasibility bounds on bipartite components.
+
+\appendix
+\section{Source Code and Reproduction}
+
+\begin{table}[H]
+\centering
+\caption{Source organization}
+\begin{tabular}{ll}
+\toprule
+File & Role \\
+\midrule
+\texttt{io.cpp/hpp} & Input parsing and row-major output \\
+\texttt{model.cpp/hpp} & Candidate graph and conflict construction \\
+\texttt{solver.cpp/hpp} & Propagation, MRV, rollback, complete search \\
+\texttt{validator.cpp/hpp} & Independent answer validation \\
+\texttt{tests/test\_runner.cpp} & Samples, exhaustive and randomized tests \\
+\texttt{tests/benchmark\_runner.cpp} & Reproducible CSV benchmark runner \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Build and run:
+
+\begin{lstlisting}[language=bash,caption={Build and execution commands}]
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+cmake --build build --config Release
+./build/Release/recover.exe < input.txt
+ctest --test-dir build -C Release --output-on-failure
+\end{lstlisting}
+
+\begin{thebibliography}{9}
+\bibitem{russell}
+S. Russell and P. Norvig.
+\textit{Artificial Intelligence: A Modern Approach}.
+Pearson, fourth edition, 2020.
+
+\bibitem{knuth4a}
+D. E. Knuth.
+\textit{The Art of Computer Programming, Volume 4A: Combinatorial Algorithms}.
+Addison-Wesley, 2011.
+\end{thebibliography}
+
+\section*{Author List}
+Author identities and contribution details are withheld in this anonymous peer
+review version.
+
+\section*{Declaration}
+We hereby declare that all work done in this project is of our independent
+effort as a group.
+
+\end{document}

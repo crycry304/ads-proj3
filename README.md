@@ -33,7 +33,10 @@ The algorithm stops after finding the first valid layout, since the problem acce
 
 ## Repository status
 
-Problem analysis and the implementation plan are complete. The production solver, test harness, benchmark results, and final report are still to be added.
+The exact solver is implemented with event-driven propagation, conflict rejection,
+forced decisions, rollback, and MRV branching. The program is now in the
+correctness-validation and performance-measurement phase. The final report and
+anonymous peer-review package are still to be prepared.
 
 ## Planned repository layout
 
@@ -96,6 +99,45 @@ The three samples cover:
 
 Implementation testing will additionally include exhaustive small-grid differential tests, randomized feasible and infeasible instances, boundary cases, and maximum-size stress tests.
 
+## Validation status
+
+- Debug and Release builds pass without compiler warnings.
+- The CTest suite covers the official samples, all 2×2 and 2×3 degree
+  matrices, 4,000 randomized differential cases, planted feasible layouts,
+  propagation statistics, conflicts, and required geometric edge cases.
+- Every constructed answer is checked again by the independent validator.
+- The 24-case Release benchmark corpus completes within the 30-second safety
+  timeout; its maximum observed median is about 0.333 seconds.
+- The problem statement publishes no time limit, so performance is reported as
+  an empirical comparison rather than an artificially fixed pass threshold.
+
 ## Build and usage
 
-The final build and execution commands will be added with the implementation. The submitted program is planned to read one test case from standard input and write either the connector states or `No Solution` to standard output.
+Build and run from the repository root:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+cmake --build build --config Release
+Get-Content tests\samples\sample1.in | .\build\Release\recover.exe
+```
+
+The submitted program reads one test case from standard input and writes either
+the connector states or `No Solution` to standard output.
+
+Validate an existing answer:
+
+```powershell
+.\build\Release\recover.exe --validate tests\samples\sample1.in tests\samples\sample1.out
+```
+
+Generate deterministic validation and benchmark cases:
+
+```powershell
+python tools/generate_cases.py --output-dir data/generated
+```
+
+Run the internal benchmark executable:
+
+```powershell
+.\build\Release\recover_benchmark.exe --repeat 5 data\generated\...\*.in
+```

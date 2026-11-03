@@ -8,12 +8,20 @@
 # Build products
 /build/
 /out/
+/tmp/
+/data/generated/
+/data/experiments/raw/
+__pycache__/
 *.o
 *.obj
 *.exe
 *.out
 *.pdb
 *.ilk
+*.aux
+*.log
+*.toc
+*.synctex.gz
 
 # Expected outputs are source data for the samples.
 !/tests/samples/*.out

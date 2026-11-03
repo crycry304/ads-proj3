@@ -3,12 +3,14 @@
 #include "solver.hpp"
 #include "validator.hpp"
 
+#include <algorithm>
 #include <bitset>
 #include <cstdint>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -21,6 +23,14 @@ namespace {
 // 2. 候选模型：顶点数、候选边数、冲突数、静态可行性；
 // 3. 答案格式：题目两个合法输出、打印往返、错误度数；
 // 4. 特殊边界：非法交叉和全零空设计。
+//
+// 两套独立的解存在性判断：
+// - BruteForceExists 枚举候选边子集，作为小规模测试真值；
+// - Solver 使用完整回溯、传播和 MRV。
+// 只有两者在所有可承受的输入上结论一致，优化后的求解器才可信。
+
+// 测试失败不会立即终止进程，而是累计失败数，
+// 这样一次运行可以同时暴露多个约束或格式问题。
 
 // 所有测试共享失败计数，最后统一决定进程退出码。
 int failures = 0;
@@ -98,6 +108,7 @@ bool BruteForceExists(const recover::Model& model) {
         if (!valid) {
             continue;
         }
+        // 掩码中的边都不冲突后，再统一检查所有顶点的精确度数。
         for (int v = 0; v < model.vertexCount; ++v) {
             if (degree[v] != model.requiredDegree[v]) {
                 valid = false;
@@ -123,9 +134,11 @@ void TestSolverAndValidation(const std::vector<std::vector<int>>& grid,
     // 有解/无解结论先与样例预期比较。
     Expect(result.found == expectedFound, "solver solvability mismatch");
     if (!result.found) {
+        // 无解样例没有方向数组可供验证，只比较预期结论。
         return;
     }
 
+    // 有解时用正式 IO 生成文本，再走独立 Validator。
     std::ostringstream output;
     recover::PrintDirections(model, result.directions, &output);
     Expect(ValidateText(model, output.str()).status ==
@@ -133,6 +146,226 @@ void TestSolverAndValidation(const std::vector<std::vector<int>>& grid,
            "solver output must pass independent validation");
 }
 
+// 对拍入口依次完成建模、暴力真值计算、正式求解和最终答案验证。
+// context 用于在失败时指出具体尺寸和序号，便于直接复现。
+void CheckDifferentialCase(const std::vector<std::vector<int>>& grid,
+                           const std::string& context) {
+    // 对拍函数先从输入重新构建模型，再用独立候选边子集枚举判断真值。
+    recover::Model model;
+    std::string error;
+    Expect(recover::BuildModel(grid, &model, &error),
+           context + ": " + error);
+
+    // expected 完全由 BruteForceExists 决定，不读取 Solver 的搜索痕迹。
+    const bool expected = BruteForceExists(model);
+    recover::Solver solver(model);
+    const recover::SolveResult result = solver.Solve();
+    Expect(result.found == expected,
+           context + ": solver disagrees with brute force");
+    if (!result.found) {
+        return;
+    }
+
+    std::ostringstream output;
+    recover::PrintDirections(model, result.directions, &output);
+    const recover::ValidationResult validation =
+        ValidateText(model, output.str());
+    Expect(validation.status == recover::ValidationStatus::kValid,
+           context + ": " + validation.message);
+}
+
+// 完整穷举 2x2 和 2x3 的所有度数矩阵。
+// 这比随机抽样更严格：输入空间中的每个点都会被检查一次。
+void TestExhaustiveSmallGrids() {
+    // 每个格子独立取 0..4。2x3 只有 5^6=15625 种输入，
+    // 可以直接与候选边子集暴力枚举逐项对拍。
+    for (const auto& dimensions : std::vector<std::pair<int, int>>{
+             {2, 2}, {2, 3}}) {
+        const int rows = dimensions.first;
+        const int cols = dimensions.second;
+        // 使用五进制编码逐项生成所有度数矩阵。
+        const int cells = rows * cols;
+        // 计算 5^(rows*cols)，作为所有度数矩阵的五进制编号上界。
+        int total = 1;
+        for (int i = 0; i < cells; ++i) {
+            total *= 5;
+        }
+
+        for (int code = 0; code < total; ++code) {
+            // 把当前编号拆成每个格子的 0..4 度数。
+            int value = code;
+            std::vector<std::vector<int>> grid(
+                rows, std::vector<int>(cols, 0));
+            // 五进制数字的每一位对应一个格子的度数 0..4。
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    grid[r][c] = value % 5;
+                    value /= 5;
+                }
+            }
+            CheckDifferentialCase(
+                grid, "exhaustive " + std::to_string(rows) + "x" +
+                          std::to_string(cols) + " code " +
+                          std::to_string(code));
+            if (failures > 5) {
+                // 同类错误已经很多时提前结束，保留可读的测试输出。
+                return;
+            }
+        }
+    }
+}
+
+// 3x3 和 3x4 的候选边最多约 14 条，
+// 因此仍可通过候选边子集暴力枚举得到可靠真值。
+void TestRandomThreeByThreeAndThreeByFour() {
+    // 3×4 最多约 14 条候选边，仍可承受 2^14 子集枚举。
+    std::mt19937 generator(20261103U);
+    std::uniform_int_distribution<int> rowsDistribution(3, 3);
+    std::uniform_int_distribution<int> colsDistribution(3, 4);
+    std::bernoulli_distribution nonZero(0.45);
+    std::uniform_int_distribution<int> degreeDistribution(1, 4);
+
+    for (int test = 0; test < 3000; ++test) {
+        const int rows = rowsDistribution(generator);
+        const int cols = colsDistribution(generator);
+        std::vector<std::vector<int>> grid(
+            rows, std::vector<int>(cols, 0));
+        // 每格先决定是否出现连接器，再生成 1..4 的目标度数。
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                if (nonZero(generator)) {
+                    grid[r][c] = degreeDistribution(generator);
+                }
+            }
+        }
+        CheckDifferentialCase(grid, "random differential " +
+                                         std::to_string(test));
+        if (failures > 5) {
+            return;
+        }
+    }
+}
+
+// 先构造一个无冲突的合法布局，再由它反推出每个格子的度数。
+// 因此这些输入按构造必然有解，Solver 不应输出 No Solution。
+void TestPlantedFeasibleLayouts() {
+    // 先在正数掩码上随机选择一个无冲突边集合，
+    // 再由该集合反算每个连接器的度数。
+    // 因此构造出的输入一定存在解，可用于检查“误报无解”。
+    std::mt19937 generator(20261104U);
+    std::uniform_int_distribution<int> sizeDistribution(3, 6);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+
+    for (int test = 0; test < 200; ++test) {
+        // 随机选择矩阵尺寸和正数位置密度。
+        const int rows = sizeDistribution(generator);
+        const int cols = sizeDistribution(generator);
+        const double density = unit(generator);
+
+        std::vector<std::vector<int>> mask(
+            rows, std::vector<int>(cols, 0));
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                mask[r][c] = unit(generator) < density ? 1 : 0;
+            }
+        }
+
+        // 先用占位度数 1 建立候选图，只借助它取得边长和冲突关系。
+        recover::Model base;
+        std::string error;
+        Expect(recover::BuildModel(mask, &base, &error), error);
+        if (base.CandidateEdgeCount() == 0) {
+            // 没有候选边就没有可供种植的合法栅栏，跳过空案例。
+            continue;
+        }
+
+        // 打乱候选边，随后贪心选择无冲突子集作为隐藏的可行设计方案。
+        std::vector<int> order(base.CandidateEdgeCount());
+        for (int i = 0; i < base.CandidateEdgeCount(); ++i) {
+            order[i] = i;
+        }
+        std::shuffle(order.begin(), order.end(), generator);
+
+        std::vector<bool> selected(base.CandidateEdgeCount(), false);
+        std::vector<int> vertexDegree(base.vertexCount, 0);
+        // 隐藏方案中每条选边给两端各增加 1 度。
+        for (int edgeId : order) {
+            // 约 55% 的候选边进入隐藏方案；冲突边则直接跳过。
+            if (unit(generator) > 0.55) {
+                continue;
+            }
+            bool conflicts = false;
+            for (int other : base.conflictEdges[edgeId]) {
+                if (selected[other]) {
+                    conflicts = true;
+                    break;
+                }
+            }
+            if (conflicts) {
+                // 与已选边交叉的候选边不能加入隐藏方案。
+                continue;
+            }
+            selected[edgeId] = true;
+            const recover::CandidateEdge& edge = base.edges[edgeId];
+            ++vertexDegree[edge.u];
+            ++vertexDegree[edge.v];
+        }
+
+        // 将隐藏方案的端点度数写回矩阵，零度位置改回 0。
+        std::vector<std::vector<int>> grid(
+            rows, std::vector<int>(cols, 0));
+        bool any = false;
+        for (int v = 0; v < base.vertexCount; ++v) {
+            grid[base.vertexRow[v]][base.vertexCol[v]] = vertexDegree[v];
+            any = any || vertexDegree[v] > 0;
+        }
+        if (any) {
+            // 隐藏方案至少含一条边，因此生成输入必然存在解。
+            TestSolverAndValidation(grid, true);
+        }
+    }
+}
+
+// 覆盖题目最容易误判的几何和计数边界。
+// 每个 TestSolverAndValidation 的第二个参数是预期是否存在解。
+void TestRequiredEdgeCases() {
+    // 单连接器没有另一端，不能形成栅栏。
+    TestSolverAndValidation({{1, 0}, {0, 0}}, false);
+
+    // 相邻的左右两点各需要一条边，必须直通。
+    TestSolverAndValidation({{1, 1}, {0, 0}}, true);
+
+    // 相邻的上下两点各需要一条边。
+    TestSolverAndValidation({{1, 0}, {1, 0}}, true);
+
+    // 跨越中间零位置的一条长水平边。
+    TestSolverAndValidation({{1, 0, 0, 1}, {0, 0, 0, 0}}, true);
+
+    // 中心连接四个方向，形成四向分叉。
+    // 四条臂各自只要求 1 度，因此唯一完成方式是全部与中心相连。
+    TestSolverAndValidation(
+        {{0, 1, 0}, {1, 4, 1}, {0, 1, 0}}, true);
+
+    // 只保留三个方向的 T 形连接器。
+    // 缺少下侧候选边时，中心度数 3 正好对应上、左、右三条边。
+    TestSolverAndValidation(
+        {{0, 1, 0}, {1, 3, 1}, {0, 0, 0}}, true);
+
+    // 两个互不相连的合法分量。
+    // 题目不要求所有连接器属于同一个栅栏，因此分开的两条边也合法。
+    TestSolverAndValidation(
+        {{1, 1, 0, 1, 1}, {0, 0, 0, 0, 0}}, true);
+
+    // 边界格只有两个方向，需求 4 条边必然不可能。
+    TestSolverAndValidation({{4, 0}, {0, 0}}, false);
+
+    // 总度数为奇数，候选图再好也无法两两配对。
+    // 每条边贡献 2 度，因此三条需求边无法闭合成合法选边集合。
+    TestSolverAndValidation({{1, 1, 0}, {1, 0, 0}}, false);
+}
+
+// 三个官方样例作为固定回归用例。
+// 答案可能不唯一，所以比较的是合法性而不是固定的输出字符串。
 void TestSolverSamples() {
     // Sample 1 是普通可行实例，用于确认搜索能找到完整布局。
     TestSolverAndValidation(
@@ -166,6 +399,8 @@ void TestSolverSamples() {
         true);
 }
 
+// 固定种子的随机差异测试，覆盖 2x2 到 3x4。
+// 该组与后续 3x3/3x4 专项组互补。
 void TestSolverAgainstBruteForce() {
     // 固定随机种子保证失败可以复现。
     std::mt19937 generator(20261102U);
@@ -204,6 +439,8 @@ void TestSolverAgainstBruteForce() {
     }
 }
 
+// 强制传播专项测试不仅要求有解，
+// 还要求统计中确实发生 queued propagation 和 forced selection。
 void TestForcedPropagation() {
     // 上排度数为 1、2、1，下面一行全为零。
     // 两条水平候选边必须同时选择；选择第一条后，
@@ -225,6 +462,7 @@ void TestForcedPropagation() {
 // 冲突传播测试不只检查最终无解，
 // 还检查统计中确实发生了“选中一条边后自动拒绝交叉边”。
 // 这能防止冲突拒绝逻辑被意外删除，却仍因其他规则碰巧得到无解。
+// 冲突专项测试检查选中边确实触发交叉边拒绝。
 void TestConflictPropagation() {
     // 四个 1 位于十字端点，横竖两条候选长边在中心零位置冲突。
     // 选中第一条后，传播应立即拒绝另一条，并发现四个端点无法全部满足。
@@ -461,6 +699,10 @@ int main() {
     TestSolverAgainstBruteForce();
     TestForcedPropagation();
     TestConflictPropagation();
+    TestExhaustiveSmallGrids();
+    TestRandomThreeByThreeAndThreeByFour();
+    TestPlantedFeasibleLayouts();
+    TestRequiredEdgeCases();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
