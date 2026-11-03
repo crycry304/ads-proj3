@@ -141,3 +141,15 @@ Run the internal benchmark executable:
 ```powershell
 .\build\Release\recover_benchmark.exe --repeat 5 data\generated\...\*.in
 ```
+
+Prepare report figure data and compile the anonymous report:
+
+```powershell
+python tools/prepare_report_data.py
+Set-Location reports
+xelatex -interaction=nonstopmode report.tex
+xelatex -interaction=nonstopmode report.tex
+```
+
+The primary report source is `reports/report.tex`; `reports/main.tex` is kept as
+a compatibility wrapper.

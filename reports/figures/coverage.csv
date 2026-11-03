@@ -1,0 +1,8 @@
+test_group,cases,label
+Samples,3,3
+Exhaustive 2x2,625,625
+Exhaustive 2x3,15625,15625
+Random 2x2-3x4,1000,1000
+Random 3x3-3x4,3000,3000
+Planted feasible,200,200
+Required edges,9,9

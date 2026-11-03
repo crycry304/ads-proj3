@@ -1,0 +1,6 @@
+case,median_ms,label
+Planted 10,0.033100,0.033
+Planted 25,0.970700,0.971
+Planted 50,12.322400,12.322
+Conflict 50,6.825800,6.826
+Dense 50,332.151000,332.151
