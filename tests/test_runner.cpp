@@ -204,6 +204,43 @@ void TestSolverAgainstBruteForce() {
     }
 }
 
+void TestForcedPropagation() {
+    // 上排度数为 1、2、1，下面一行全为零。
+    // 两条水平候选边必须同时选择；选择第一条后，
+    // 中间连接器只剩一条未知边，传播应自动强制选择第二条。
+    recover::Model model = BuildFromText(
+        "2 3\n"
+        "1 2 1\n"
+        "0 0 0\n");
+    recover::Solver solver(model);
+    const recover::SolveResult result = solver.Solve();
+
+    Expect(result.found, "forced-selection fixture must be solvable");
+    Expect(result.stats.propagationEvents > 0,
+           "propagation queue must process changed endpoints");
+    Expect(result.stats.forcedSelections > 0,
+           "fixture must trigger forced selection");
+}
+
+// 冲突传播测试不只检查最终无解，
+// 还检查统计中确实发生了“选中一条边后自动拒绝交叉边”。
+// 这能防止冲突拒绝逻辑被意外删除，却仍因其他规则碰巧得到无解。
+void TestConflictPropagation() {
+    // 四个 1 位于十字端点，横竖两条候选长边在中心零位置冲突。
+    // 选中第一条后，传播应立即拒绝另一条，并发现四个端点无法全部满足。
+    recover::Model model = BuildFromText(
+        "3 3\n"
+        "0 1 0\n"
+        "1 0 1\n"
+        "0 1 0\n");
+    recover::Solver solver(model);
+    const recover::SolveResult result = solver.Solve();
+
+    Expect(!result.found, "crossing fixture must be impossible");
+    Expect(result.stats.conflictRejections > 0,
+           "selected edge must reject its crossing edge");
+}
+
 // 解析测试覆盖三类输入行为：
 // 1. 合法矩阵应被完整读入；
 // 2. 单个度数越界应在进入建模前失败；
@@ -422,6 +459,8 @@ int main() {
     TestEmptyLayout();
     TestSolverSamples();
     TestSolverAgainstBruteForce();
+    TestForcedPropagation();
+    TestConflictPropagation();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

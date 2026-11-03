@@ -48,13 +48,34 @@ namespace recover {
 // - 尚未到达目标度数的连接器集合。
 // 一次派生的子节点数量不超过 6；
 // 每次失败恢复父节点状态，因此不同兄弟分支互不影响。
+//
+// 增量传播版本额外维护以下不变量：
+// - 每条边的状态只从 UNKNOWN 进入 SELECTED 或 REJECTED 一次；
+// - unknownDegree[v] 等于 v 的 UNKNOWN 关联边数；
+// - 状态变化后，两个端点至少各有一次机会重新检查；
+// - 只要 selected <= required 且 selected+unknown >= required，
+//   当前连接器还有完成可能；否则整个分支立即失败；
+// - 选中边引起的冲突拒绝也必须进入队列，
+//   因为它会减少冲突边端点的 unknownDegree。
+//
+// 队列中的元素是“连接器编号”，不是候选边编号。
+// 同一连接器可能重复入队，这是刻意允许的：
+// 每次处理都会读取该顶点最新计数，旧事件自然变成空操作。
+// 这样实现简单，且一个顶点最多四条候选边，重复次数可控。
 
 // 构造阶段只初始化边状态和每个连接器当前的已选度数。
 // 这里不构建候选边，因为 Model 已经在 BuildModel 中完成静态构造。
 Solver::Solver(const Model& model)
     : model_(model),
       edgeStates_(model.CandidateEdgeCount(), kUnknown),
-      selectedDegree_(model.vertexCount, 0) {}
+      selectedDegree_(model.vertexCount, 0),
+      unknownDegree_(model.vertexCount, 0) {
+    // 初始时所有关联候选边都是 UNKNOWN。
+    for (int v = 0; v < model_.vertexCount; ++v) {
+        unknownDegree_[v] =
+            static_cast<int>(model_.incidentEdges[v].size());
+    }
+}
 
 // Solve 是唯一公开入口。
 // 它先处理静态模型已经确定的无解，再启动深度优先搜索。
@@ -96,17 +117,37 @@ bool Solver::AssignEdge(int edgeId, EdgeState newState) {
     trail_.push_back({edgeId, edgeStates_[edgeId]});
     edgeStates_[edgeId] = newState;
 
+    const CandidateEdge& edge = model_.edges[edgeId];
+
+    // 无论选择还是拒绝，这条边都不再属于未知集合。
+    // 两个端点都可能因此触发新的强制规则，所以都加入事件队列。
+    --unknownDegree_[edge.u];
+    --unknownDegree_[edge.v];
+    pendingVertices_.push_back(edge.u);
+    pendingVertices_.push_back(edge.v);
+
     if (newState == kSelected) {
         // 选边会同时增加两个端点的度数，这正是无向栅栏的含义。
-        const CandidateEdge& edge = model_.edges[edgeId];
         ++selectedDegree_[edge.u];
         ++selectedDegree_[edge.v];
 
-        // 选边前检查所有已经选中的冲突边。
-        // 当前版本不顺手把冲突边标成 REJECTED，留到后续传播版本优化。
+        // 如果已经存在冲突的选中边，当前分支立即失败。
         if (HasSelectedConflict(edgeId)) {
-            // 调用者会回滚 checkpoint，因此这里不需要自行恢复状态。
             return false;
+        }
+
+        // 一旦选中某条边，与它在空白格交叉的所有边都不可能再出现。
+        // 这里直接把它们设为 REJECTED，而不是等未来尝试时才发现矛盾。
+        for (int other : model_.conflictEdges[edgeId]) {
+            if (edgeStates_[other] == kSelected) {
+                return false;
+            }
+            if (edgeStates_[other] == kUnknown) {
+                ++result_.stats.conflictRejections;
+                if (!AssignEdge(other, kRejected)) {
+                    return false;
+                }
+            }
         }
     }
     return true;
@@ -138,6 +179,64 @@ bool Solver::IsComplete() const {
     return true;
 }
 
+// Propagate 消费事件队列，直到没有新的强制变化。
+//
+// 对每个连接器 v 维护三个量：
+// selected = 已经选中的关联边数；
+// unknown  = 尚未决定的关联边数；
+// required = 输入要求的目标度数。
+//
+// 两类强制规则：
+// 1. selected == required：
+//    已经满足度数，所有 UNKNOWN 边都必须拒绝。
+// 2. selected + unknown == required：
+//    为了达到目标度数，所有 UNKNOWN 边都必须选择。
+//
+// 第二条规则中的一个选择还可能触发冲突拒绝，
+// 冲突拒绝又会让其他连接器的 unknown 减少，因此必须继续处理队列。
+bool Solver::Propagate() {
+    // 使用一个 vector 加 pendingHead_ 作为 FIFO 队列。
+    // 消费过的前缀不立即 erase，避免重复搬移元素。
+    while (pendingHead_ < pendingVertices_.size()) {
+        const int v = pendingVertices_[pendingHead_++];
+        ++result_.stats.propagationEvents;
+
+        const int required = model_.requiredDegree[v];
+        const int selected = selectedDegree_[v];
+        const int unknown = unknownDegree_[v];
+
+        // 当前分支已经不可能恰好满足 v 的度数。
+        if (selected > required || selected + unknown < required) {
+            return false;
+        }
+
+        if (selected == required) {
+            // 已经达到目标度数后，任何额外选边都会超度数，
+            // 所以所有仍未决定的关联边都必须拒绝。
+            for (int edgeId : model_.incidentEdges[v]) {
+                if (edgeStates_[edgeId] == kUnknown) {
+                    ++result_.stats.forcedRejections;
+                    if (!AssignEdge(edgeId, kRejected)) {
+                        return false;
+                    }
+                }
+            }
+        } else if (selected + unknown == required) {
+            // 即使当前仍为未知的边全部选上，也只能刚好达到目标。
+            // 因此这些未知边不是“可选项”，而是全部强制选择。
+            for (int edgeId : model_.incidentEdges[v]) {
+                if (edgeStates_[edgeId] == kUnknown) {
+                    ++result_.stats.forcedSelections;
+                    if (!AssignEdge(edgeId, kSelected)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 // Search 返回 true 表示当前状态已经找到一个完整合法答案。
 // Search 返回 false 表示当前状态的所有局部组合都已穷尽且全部失败。
 //
@@ -148,6 +247,13 @@ bool Solver::Search(int depth) {
     ++result_.stats.nodes;
     result_.stats.maximumDepth =
         std::max(result_.stats.maximumDepth, depth);
+
+    // 每一层搜索先做增量传播。
+    // 传播失败表示当前分支没有合法完成，不必继续枚举局部组合。
+    if (!Propagate()) {
+        ++result_.stats.backtracks;
+        return false;
+    }
 
     if (IsComplete()) {
         return true;
@@ -246,13 +352,20 @@ void Solver::Rollback(std::size_t checkpoint) {
         const TrailEntry entry = trail_.back();
         trail_.pop_back();
 
+        const CandidateEdge& edge = model_.edges[entry.edgeId];
         if (edgeStates_[entry.edgeId] == kSelected) {
-            const CandidateEdge& edge = model_.edges[entry.edgeId];
             --selectedDegree_[edge.u];
             --selectedDegree_[edge.v];
         }
+        // 撤销时这条边重新回到 UNKNOWN，两个端点的未知计数都要加一。
+        ++unknownDegree_[edge.u];
+        ++unknownDegree_[edge.v];
         edgeStates_[entry.edgeId] = entry.previousState;
     }
+
+    // 父分支不继承当前分支尚未消费的事件。
+    pendingVertices_.clear();
+    pendingHead_ = 0;
 }
 
 // 生成 availableEdges 中所有大小恰好为 need 的组合。

@@ -19,6 +19,19 @@ struct SearchStats {
     // 只有当前节点的所有局部组合都失败后才计入一次 backtrack。
     std::uint64_t backtracks = 0;
 
+    // 从事件队列取出并重新检查的连接器次数。
+    // 同一个连接器可能因多次状态变化而多次入队。
+    std::uint64_t propagationEvents = 0;
+
+    // 传播过程中由“已经满足度数”规则强制拒绝的边数。
+    std::uint64_t forcedRejections = 0;
+
+    // 传播过程中由“剩余边必须全选”规则强制选择的边数。
+    std::uint64_t forcedSelections = 0;
+
+    // 因为与已选边在空白格交叉而被自动拒绝的边数。
+    std::uint64_t conflictRejections = 0;
+
     // 统计实际递归深度，用于后续比较固定顺序和 MRV。
     int maximumDepth = 0;
 };
@@ -87,6 +100,7 @@ private:
 
     bool AssignEdge(int edgeId, EdgeState newState);
     bool HasSelectedConflict(int edgeId) const;
+    bool Propagate();
     bool Search(int depth);
     bool IsComplete() const;
     bool TryCombination(const BranchChoice& choice,
@@ -104,6 +118,16 @@ private:
 
     // selectedDegree_ 的长度固定等于连接器数，只统计 SELECTED。
     std::vector<int> selectedDegree_;
+
+    // unknownDegree_[v] 表示 v 的关联候选边中仍为 UNKNOWN 的数量。
+    // selected + unknown < required 时可以立即判定当前分支失败。
+    std::vector<int> unknownDegree_;
+
+    // 增量传播的事件队列。
+    // 某个端点状态变化后将连接器放入 pendingVertices_，
+    // 直到队列消费完毕，所有可推导的强制状态都已处理。
+    std::vector<int> pendingVertices_;
+    std::size_t pendingHead_ = 0;
 
     // trail_ 是当前递归路径上的增量修改记录。
     std::vector<TrailEntry> trail_;
