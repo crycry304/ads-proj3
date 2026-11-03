@@ -31,13 +31,19 @@ def main() -> None:
     # Coverage counts come from the deterministic test suite implemented in
     # tests/test_runner.cpp. They are not benchmark samples.
     coverage = [
-        {"test_group": "Samples", "cases": "3", "label": "3"},
+        {"test_group": "Official samples", "cases": "3", "label": "3"},
+        {"test_group": "Parser cases", "cases": "13", "label": "13"},
+        {"test_group": "Model checks", "cases": "8", "label": "8"},
+        {"test_group": "Validator accepts", "cases": "5", "label": "5"},
+        {"test_group": "Validator rejects", "cases": "15", "label": "15"},
+        {"test_group": "CLI black box", "cases": "10", "label": "10"},
         {"test_group": "Exhaustive 2x2", "cases": "625", "label": "625"},
         {"test_group": "Exhaustive 2x3", "cases": "15625", "label": "15625"},
         {"test_group": "Random 2x2-3x4", "cases": "1000", "label": "1000"},
         {"test_group": "Random 3x3-3x4", "cases": "3000", "label": "3000"},
         {"test_group": "Planted feasible", "cases": "200", "label": "200"},
-        {"test_group": "Required edges", "cases": "9", "label": "9"},
+        {"test_group": "Propagation fixtures", "cases": "2", "label": "2"},
+        {"test_group": "Required geometry", "cases": "9", "label": "9"},
     ]
     write_csv(FIGURES / "coverage.csv", ["test_group", "cases", "label"], coverage)
 

@@ -1,8 +1,14 @@
 test_group,cases,label
-Samples,3,3
+Official samples,3,3
+Parser cases,13,13
+Model checks,8,8
+Validator accepts,5,5
+Validator rejects,15,15
+CLI black box,10,10
 Exhaustive 2x2,625,625
 Exhaustive 2x3,15625,15625
 Random 2x2-3x4,1000,1000
 Random 3x3-3x4,3000,3000
 Planted feasible,200,200
-Required edges,9,9
+Propagation fixtures,2,2
+Required geometry,9,9
