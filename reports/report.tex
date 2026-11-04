@@ -99,7 +99,9 @@ differential tests, planted-feasible layouts, and targeted geometric cases. The
 24-case Release benchmark uses five measured runs per input. Every case completed
 within the 30-second safety timeout; the largest median was 332.151 ms.
 Conflict propagation reduced the largest planted search from 39,888 to 162 nodes,
-while MRV helped medium inputs but did not improve every case.
+while MRV helped medium inputs but did not improve every case. A separate
+fixed-seed adversarial planted instance remains pending after a 30-second limit,
+documenting the search-tree growth that the acceptance corpus does not cover.
 \end{abstract}
 
 \noindent\textbf{Keywords:} layout recovery; degree constraints; candidate graph;
@@ -403,8 +405,8 @@ instead of reducing the entire suite to a single pass/fail signal.
   xmode=log,
   y dir=reverse,
   width=0.88\linewidth,
-  height=10.6cm,
-  symbolic y coords={Official samples,Parser cases,Model checks,Validator accepts,Validator rejects,CLI black box,Exhaustive 2x2,Exhaustive 2x3,Random 2x2-3x4,Random 3x3-3x4,Planted feasible,Propagation fixtures,Required geometry},
+  height=11.2cm,
+  symbolic y coords={Official samples,Parser cases,Model checks,Validator accepts,Validator rejects,CLI black box,Exhaustive 2x2,Exhaustive 2x3,Random 2x2-3x4,Random 3x3-3x4,Planted feasible,Propagation fixtures,Required geometry,Adversarial stress},
   ytick=data,
   y tick label style={font=\scriptsize},
   xlabel={Number of test cases (log scale)},
@@ -451,31 +453,37 @@ Random $3\times3$--$3\times4$ & 3,000 & Larger differential & Oracle agreement &
 Planted feasible & up to 200 & Hidden valid witness & Solver finds a layout & All matched & n/a & pass \\
 Propagation & 2 & Forced and conflict decisions & Counters increase & All matched & n/a & pass \\
 Required geometry & 9 & Long edges, T, cross, disconnection & Expected feasibility & All matched & n/a & pass \\
+Adversarial stress & 1 & Fixed dense $50\times50$ planted probe & Complete within 30 s & Timeout after 30 s & Search-tree growth & pending \\
 \bottomrule
 \end{longtable}
 \end{scriptsize}
 
-All observed cases pass, so no failure diagnosis is pending. The exhaustive tests
-compare existence rather than one output string because multiple valid layouts
-may exist. For each solver-produced layout the validator checks all constraints
-independently. Input failures are kept separate from valid but infeasible
-puzzles, and CLI tests verify that usage and diagnostics never contaminate the
-answer on standard output.
+All correctness and acceptance cases pass. The fixed adversarial stress probe is
+explicitly retained as \texttt{pending}: it does not complete within 30 seconds,
+so it is not reported as a pass or as proof of infeasibility. The exhaustive
+tests compare existence rather than one output string because multiple valid
+layouts may exist. For each solver-produced layout the validator checks all
+constraints independently. Input failures are kept separate from valid but
+infeasible puzzles, and CLI tests verify that usage and diagnostics never
+contaminate the answer on standard output.
 
 The default \texttt{correctness} CTest label runs the nine named C++ groups, ten
 CLI cases, and the comment-quality gate when Python is available. The complete
 24-case benchmark is registered only when
 \texttt{ADS\_PROJ3\_ENABLE\_PERFORMANCE\_TESTS} is enabled and is selected by the
-separate \texttt{performance} label. This keeps normal correctness runs fast and
+separate \texttt{performance} label. The adversarial probe similarly lives under
+the separate \texttt{stress} label. This keeps normal correctness runs fast and
 independent of timing noise.
 
 On the evaluation environment, all 20 correctness-labelled CTest entries passed
 in both Debug and Release builds. The optional performance entry passed all 24
-cases with five deterministic repetitions and no search-metric drift.
+cases with five deterministic repetitions and no search-metric drift. The stress
+harness classified its fixed case as \texttt{pending} after the 30-second solver
+limit.
 
 \subsection{Benchmark design}
 
-The deterministic corpus contains 24 cases from seed \texttt{20261103}. It
+The deterministic acceptance corpus contains 24 cases from seed \texttt{20261103}. It
 contains sparse and dense random degree matrices, planted feasible layouts,
 conflict-heavy grids, fragmented components, and infeasible instances. Sizes
 range from $10\times10$ to $50\times50$.
@@ -650,8 +658,9 @@ adjacency. All are bounded by $O(nm+M)$.
 No official time limit is given by the problem statement. Measurements therefore
 describe the current machine, compiler, seed set, and chosen corpus. A separate
 50 by 50 planted probe with density 0.50--0.55 exceeded a 15--30 second safety
-window. This is explicitly excluded from the fixed acceptance corpus and is
-reported as a limitation for dense random adversarial degree systems.
+window. It is generated with a fixed seed and retained in the \texttt{stress}
+CTest with status \texttt{pending}; it is not part of the all-pass acceptance
+dataset and is reported as a limitation for dense adversarial degree systems.
 
 The conflict graph captures only forbidden selection pairs. Component
 decomposition is not applied directly because conflict edges can couple
@@ -689,6 +698,7 @@ File & Responsibility \\
 \texttt{test\_runner.cpp} & Nine named unit, solver, and Validator groups \\
 \texttt{run\_cli\_tests.cmake} & Black-box CLI streams and exit codes \\
 \texttt{run\_performance\_tests.cmake} & Optional deterministic corpus CTest \\
+\texttt{run\_stress\_tests.cmake} & Fixed adversarial pending/timeout probe \\
 \texttt{benchmark\_runner.cpp} & Repetition and CSV instrumentation \\
 \bottomrule
 \end{tabular}
@@ -754,6 +764,14 @@ When Python 3 is available, the same 24-case corpus can be run through CTest:
 \begin{lstlisting}[language=bash]
 cmake -S . -B build -DADS_PROJ3_ENABLE_PERFORMANCE_TESTS=ON
 ctest --test-dir build -C Release -L performance --output-on-failure
+\end{lstlisting}
+
+The adversarial stress probe is run separately and records both completion and
+the expected pending timeout state:
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build -DADS_PROJ3_ENABLE_STRESS_TESTS=ON
+ctest --test-dir build -C Release -L stress --output-on-failure
 \end{lstlisting}
 
 Each raw benchmark row contains model size, conflict count, found status, DFS

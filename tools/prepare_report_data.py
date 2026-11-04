@@ -44,6 +44,7 @@ def main() -> None:
         {"test_group": "Planted feasible", "cases": "200", "label": "200"},
         {"test_group": "Propagation fixtures", "cases": "2", "label": "2"},
         {"test_group": "Required geometry", "cases": "9", "label": "9"},
+        {"test_group": "Adversarial stress", "cases": "1", "label": "1"},
     ]
     write_csv(FIGURES / "coverage.csv", ["test_group", "cases", "label"], coverage)
 
