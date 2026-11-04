@@ -61,8 +61,9 @@ ads-proj3/
 ├── tools/
 │   ├── check_comments.py
 │   ├── generate_cases.py
-│   ├── make_report_figures.py
+│   ├── generate_stress_cases.py
 │   ├── prepare_report_data.py
+│   ├── run_stress_tests.py
 │   └── run_benchmarks.py
 ├── data/
 │   └── experiments/
@@ -114,6 +115,8 @@ stress tests.
 - Every constructed answer is checked again by the independent validator.
 - The 24-case Release benchmark corpus completes within the 30-second safety
   timeout; its maximum observed median is about 0.333 seconds.
+- A separate fixed-seed adversarial 50×50 stress probe is retained as a
+  documented `pending` timeout after 30 seconds instead of being omitted.
 - The problem statement publishes no time limit, so performance is reported as
   an empirical comparison rather than an artificially fixed pass threshold.
 - All submitted C++ comments are English, and no Chinese source text remains.
@@ -162,6 +165,13 @@ CTest when Python 3 is available:
 ```powershell
 cmake -S . -B build -DADS_PROJ3_ENABLE_PERFORMANCE_TESTS=ON
 ctest --test-dir build -C Release -L performance --output-on-failure
+```
+
+Run the optional adversarial stress probe with a 30-second solver limit:
+
+```powershell
+cmake -S . -B build -DADS_PROJ3_ENABLE_STRESS_TESTS=ON
+ctest --test-dir build -C Release -L stress --output-on-failure
 ```
 
 Check the submitted comment language and density before committing:

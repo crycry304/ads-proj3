@@ -44,6 +44,11 @@ option(
     "Register the full 24-case benchmark corpus as a CTest"
     OFF
 )
+option(
+    ADS_PROJ3_ENABLE_STRESS_TESTS
+    "Register the fixed adversarial 50x50 stress probe as a CTest"
+    OFF
+)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -134,6 +139,29 @@ if(BUILD_TESTING)
         else()
             message(WARNING
                 "Performance tests requested, but Python 3 was not found")
+        endif()
+    endif()
+
+    if(ADS_PROJ3_ENABLE_STRESS_TESTS)
+        if(Python3_Interpreter_FOUND)
+            add_test(
+                NAME stress.adversarial-dense
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DPYTHON_EXECUTABLE=${Python3_EXECUTABLE}"
+                    "-DBENCHMARK_EXE=$<TARGET_FILE:recover_benchmark>"
+                    "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/stress-tests"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_stress_tests.cmake"
+            )
+            set_tests_properties(
+                stress.adversarial-dense
+                PROPERTIES
+                    LABELS "stress"
+                    TIMEOUT 45
+            )
+        else()
+            message(WARNING
+                "Stress tests requested, but Python 3 was not found")
         endif()
     endif()
 endif()
